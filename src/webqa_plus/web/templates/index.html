@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebQA-Plus | AI-Powered Web Testing</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <span class="logo-icon">🧪</span>
+                    <span class="logo-text">WebQA-Plus</span>
+                </div>
+            </div>
+
+            <nav class="sidebar-nav">
+                <a href="#" class="nav-item active" data-section="setup">
+                    <span class="nav-icon">⚙️</span>
+                    <span>Setup</span>
+                </a>
+                <a href="#" class="nav-item" data-section="test">
+                    <span class="nav-icon">🚀</span>
+                    <span>Test</span>
+                </a>
+                <a href="#" class="nav-item" data-section="reports">
+                    <span class="nav-icon">📊</span>
+                    <span>Reports</span>
+                </a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="version">v1.0.0</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="main-header">
+                <h1>WebQA-Plus</h1>
+                <p class="subtitle">Autonomous AI-Powered Web Testing Platform</p>
+            </header>
+
+            <!-- Setup Section -->
+            <section id="setup-section" class="content-section active">
+                <div class="section-header">
+                    <h2>⚙️ Configuration</h2>
+                    <p>Configure your test environment and LLM provider</p>
+                </div>
+
+                <!-- Provider Selection -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🤖 Select LLM Provider</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="provider-grid" id="provider-grid">
+                            <!-- Providers will be populated by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Provider Settings -->
+                <div class="card" id="provider-settings-card" style="display: none;">
+                    <div class="card-header">
+                        <h3>🔑 Provider Configuration</h3>
+                    </div>
+                    <div class="card-body">
+                        <form id="provider-form">
+                            <div class="form-group">
+                                <label for="api-key">API Key</label>
+                                <div class="input-group">
+                                    <input type="password" id="api-key" name="api_key" placeholder="Enter your API key"
+                                        required>
+                                    <button type="button" class="btn-icon" id="toggle-key" title="Show/Hide">
+                                        👁️
+                                    </button>
+                                </div>
+                                <small class="help-text" id="api-key-hint"></small>
+                            </div>
+
+                            <div class="form-group">
+                                <label for="model">Model</label>
+                                <select id="model" name="model" required>
+                                    <option value="">Select a model...</option>
+                                </select>
+                            </div>
+
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="max-tokens">Max Tokens</label>
+                                    <input type="number" id="max-tokens" name="max_tokens" value="4096" min="100"
+                                        max="8000">
+                                </div>
+                                <div class="form-group">
+                                    <label for="temperature">Temperature</label>
+                                    <input type="range" id="temperature" name="temperature" min="0" max="1" step="0.1"
+                                        value="0.3">
+                                    <span class="range-value" id="temperature-value">0.3</span>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Target URL -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🌐 Target Configuration</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label for="target-url">Target URL</label>
+                            <div class="input-with-icon">
+                                <span class="input-icon">🔗</span>
+                                <input type="url" id="target-url" name="url" placeholder="https://example.com" required>
+                            </div>
+                            <small class="help-text">The website URL you want to test</small>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="auth-enabled" name="auth_enabled">
+                                <span class="checkmark"></span>
+                                <span class="label-text">Require Authentication</span>
+                            </label>
+                        </div>
+
+                        <div id="auth-fields" class="auth-fields" style="display: none;">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="auth-email">Email</label>
+                                    <input type="email" id="auth-email" name="auth_email"
+                                        placeholder="user@example.com">
+                                </div>
+                                <div class="form-group">
+                                    <label for="auth-password">Password</label>
+                                    <input type="password" id="auth-password" name="auth_password"
+                                        placeholder="Enter password">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Testing Options -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🔍 Testing Options</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="test-mode">Test Mode</label>
+                                <select id="test-mode" name="mode">
+                                    <option value="stealth">🔒 Stealth Mode (Headless)</option>
+                                    <option value="visual">👁️ Visual Mode (Headed)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="browser">Browser</label>
+                                <select id="browser" name="browser">
+                                    <option value="chromium">🌐 Chromium</option>
+                                    <option value="firefox">🦊 Firefox</option>
+                                    <option value="webkit">🍎 WebKit</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="max-steps">Max Steps: <span id="steps-value">200</span></label>
+                            <input type="range" id="max-steps" name="max_steps" min="10" max="500" value="200"
+                                step="10">
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="screenshot_on_error" checked>
+                                <span class="checkmark"></span>
+                                <span class="label-text">Capture screenshots on errors</span>
+                            </label>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" name="screenshot_on_action" checked>
+                                <span class="checkmark"></span>
+                                <span class="label-text">Capture screenshots on actions</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="actions">
+                    <button type="button" class="btn btn-primary btn-large" id="start-test-btn" disabled>
+                        <span class="btn-icon">🚀</span>
+                        <span>Start Test</span>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Test Section -->
+            <section id="test-section" class="content-section">
+                <div class="section-header">
+                    <h2>🚀 Test Execution</h2>
+                    <p>Monitor your test progress in real-time</p>
+                </div>
+
+                <div class="card" id="test-status-card">
+                    <div class="card-header">
+                        <h3>📊 Test Status</h3>
+                        <span class="status-badge" id="test-status">Ready</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="progress-container">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+                            </div>
+                            <span class="progress-text" id="progress-text">0%</span>
+                        </div>
+
+                        <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="stat-icon">👣</div>
+                                <div class="stat-value" id="stat-steps">0</div>
+                                <div class="stat-label">Steps</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon">🔗</div>
+                                <div class="stat-value" id="stat-urls">0</div>
+                                <div class="stat-label">URLs Visited</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon">🔄</div>
+                                <div class="stat-value" id="stat-flows">0</div>
+                                <div class="stat-label">Flows Discovered</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-icon">✅</div>
+                                <div class="stat-value" id="stat-results">0</div>
+                                <div class="stat-label">Test Results</div>
+                            </div>
+                        </div>
+
+                        <div class="log-container" id="log-container">
+                            <div class="log-header">
+                                <h4>📝 Activity Log</h4>
+                            </div>
+                            <div class="log-content" id="log-content">
+                                <div class="log-entry log-info">
+                                    <span class="log-time">--:--:--</span>
+                                    <span class="log-message">Waiting to start...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="actions">
+                    <button type="button" class="btn btn-secondary" id="back-to-setup-btn">
+                        ← Back to Setup
+                    </button>
+                    <button type="button" class="btn btn-secondary" id="rerun-test-btn" disabled>
+                        🔁 Re-run Test
+                    </button>
+                    <button type="button" class="btn btn-danger" id="stop-test-btn" disabled>
+                        🛑 Stop Test
+                    </button>
+                </div>
+            </section>
+
+            <!-- Reports Section -->
+            <section id="reports-section" class="content-section">
+                <div class="section-header">
+                    <h2>📊 Test Reports</h2>
+                    <p>View and download your test reports</p>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📄 Recent Reports</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="reports-list" id="reports-list">
+                            <div class="empty-state">
+                                <div class="empty-icon">📭</div>
+                                <h4>No Reports Yet</h4>
+                                <p>Run your first test to generate a report</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay" style="display: none;">
+        <div class="loading-spinner"></div>
+        <p>Starting test...</p>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>

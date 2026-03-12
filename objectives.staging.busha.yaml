@@ -1,0 +1,13 @@
+objectives:
+  - name: register_flow
+    description: Validate user registration and onboarding journey
+    critical_paths:
+      - ["register", "signup", "verify", "continue"]
+  - name: buy_asset_flow
+    description: Validate buy asset journey from dashboard/trade surfaces
+    critical_paths:
+      - ["buy", "asset", "amount", "confirm"]
+  - name: sell_asset_flow
+    description: Validate sell asset journey from dashboard/trade surfaces
+    critical_paths:
+      - ["sell", "asset", "amount", "confirm"]

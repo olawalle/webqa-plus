@@ -1,0 +1,14 @@
+objectives:
+  - name: signup_and_recovery
+    description: Validate signup and forgot-password related flows dynamically
+    critical_paths:
+      - ["sign up", "create account", "verify", "continue"]
+      - ["forgot", "reset", "password", "submit"]
+  - name: core_navigation
+    description: Validate key authenticated and unauthenticated navigation surfaces
+    critical_paths:
+      - ["login", "dashboard", "home", "settings"]
+  - name: scheduling_and_records
+    description: Validate service/staff/appointment records journeys where available
+    critical_paths:
+      - ["service", "staff", "appointment", "create"]

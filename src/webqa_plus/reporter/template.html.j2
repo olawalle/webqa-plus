@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }}</title>
+</head>
+<body>
+    {# Cover Page #}
+    <div class="cover">
+        <div style="font-size: 80px; margin-bottom: 30px;">🧪</div>
+        <h1>WebQA-Plus</h1>
+        <div class="subtitle">Autonomous AI Web QA Test Report</div>
+        
+        <div class="metadata">
+            <p><strong>Generated:</strong> {{ generated_at | format_datetime }}</p>
+            <p><strong>Test Duration:</strong> {{ "%.1f" | format(duration) }} seconds</p>
+            <p><strong>Target URL:</strong> {{ config.testing.url }}</p>
+            <p><strong>Mode:</strong> {{ config.testing.mode | upper }}</p>
+        </div>
+    </div>
+
+    {# Executive Summary #}
+    <h1>Executive Summary</h1>
+    
+    <div class="metrics-grid">
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.coverage_pct | round(1) }}%</div>
+            <div class="metric-label">Coverage</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.successful_steps }}</div>
+            <div class="metric-label">Passed</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.failed_steps }}</div>
+            <div class="metric-label">Failed</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.visited_urls }}</div>
+            <div class="metric-label">Pages</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.completed_flows }}</div>
+            <div class="metric-label">Flows</div>
+        </div>
+        <div class="metric-card">
+            <div class="metric-value">{{ metrics.llm_calls }}</div>
+            <div class="metric-label">LLM Calls</div>
+        </div>
+    </div>
+
+    <h2>Coverage Overview</h2>
+    
+    <div class="coverage-bar">
+        <div class="coverage-fill" style="width: {{ metrics.coverage_pct }}%"></div>
+    </div>
+    <p>Overall test coverage: {{ metrics.coverage_pct | round(1) }}%</p>
+
+    <h2>Test Results</h2>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Total Steps</td>
+                <td>{{ metrics.total_steps }}</td>
+            </tr>
+            <tr>
+                <td>Successful Steps</td>
+                <td><span class="status-success">{{ metrics.successful_steps }}</span></td>
+            </tr>
+            <tr>
+                <td>Failed Steps</td>
+                <td><span class="status-failed">{{ metrics.failed_steps }}</span></td>
+            </tr>
+            <tr>
+                <td>Success Rate</td>
+                <td>{{ metrics.success_rate }}</td>
+            </tr>
+            <tr>
+                <td>Flows Discovered</td>
+                <td>{{ metrics.total_flows }}</td>
+            </tr>
+            <tr>
+                <td>Flows Completed</td>
+                <td>{{ metrics.completed_flows }}</td>
+            </tr>
+            <tr>
+                <td>Estimated Cost</td>
+                <td>{{ metrics.estimated_cost }}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    {# User Flows #}
+    <div class="page-break"></div>
+    <h1>Discovered User Flows</h1>
+
+    {% if flows %}
+        {% for flow in flows %}
+            <h2>{{ flow.name }}</h2>
+            <p><strong>Description:</strong> {{ flow.description or 'No description' }}</p>
+            <p><strong>Status:</strong> {{ flow.status }}</p>
+            <p><strong>Start URL:</strong> {{ flow.start_url }}</p>
+            {% if flow.end_url %}
+                <p><strong>End URL:</strong> {{ flow.end_url }}</p>
+            {% endif %}
+
+            {% if flow.steps %}
+                <h3>Flow Steps</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Agent</th>
+                            <th>Action</th>
+                            <th>Target</th>
+                            <th>Status</th>
+                            <th>Duration</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for step in flow.steps %}
+                            <tr>
+                                <td>{{ step.step_number }}</td>
+                                <td>{{ step.agent }}</td>
+                                <td>{{ step.action }}</td>
+                                <td>{{ step.target or '-' }}</td>
+                                <td>
+                                    {% if step.status == 'success' %}
+                                        <span class="status-success">✓ Success</span>
+                                    {% elif step.status == 'failed' %}
+                                        <span class="status-failed">✗ Failed</span>
+                                    {% else %}
+                                        <span class="status-pending">⏳ {{ step.status }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ step.duration_ms or '-' }} ms</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% endif %}
+
+            {% if not loop.last %}
+                <div class="page-break"></div>
+            {% endif %}
+        {% endfor %}
+    {% else %}
+        <p>No flows discovered during testing.</p>
+    {% endif %}
+
+    {# Test Details #}
+    <div class="page-break"></div>
+    <h1>Test Step Details</h1>
+
+    {% if test_results %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Step</th>
+                    <th>Agent</th>
+                    <th>Action</th>
+                    <th>Status</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for result in test_results %}
+                    <tr>
+                        <td>{{ result.step_number }}</td>
+                        <td>{{ result.agent }}</td>
+                        <td>{{ result.action }} {% if result.target %}on {{ result.target }}{% endif %}</td>
+                        <td>
+                            {% if result.status == 'success' %}
+                                <span class="status-success">✓</span>
+                            {% elif result.status == 'failed' %}
+                                <span class="status-failed">✗</span>
+                            {% else %}
+                                {{ result.status }}
+                            {% endif %}
+                        </td>
+                        <td>{{ result.error_message or '-' }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p>No test results recorded.</p>
+    {% endif %}
+
+    {# Errors #}
+    {% if errors %}
+        <div class="page-break"></div>
+        <h1>Errors Encountered</h1>
+
+        {% for error in errors %}
+            <div class="error-box">
+                <pre>{{ error }}</pre>
+            </div>
+        {% endfor %}
+    {% endif %}
+
+    {# Footer #}
+    <div class="page-break"></div>
+    <h1>Appendix</h1>
+
+    <h2>Configuration</h2>
+    <pre>{{ config | tojson(indent=2) }}</pre>
+
+    <hr>
+    <p style="text-align: center; color: #666; font-size: 9pt;">
+        Generated by WebQA-Plus v1.0.0 | Autonomous AI Web QA Testing
+    </p>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# WebQA-Plus Configuration
+
+# LLM Provider Configuration (new unified format)
+llm:
+  provider: "openai"  # Options: openai, anthropic, openrouter
+  api_key: "${OPENAI_API_KEY}"
+  model: "gpt-4-turbo-preview"
+  max_tokens: 4096
+  temperature: 0.3
+  # base_url: null  # Optional: custom API endpoint
+
+# Legacy OpenAI Configuration (deprecated, use 'llm' above)
+openai:
+  api_key: "${OPENAI_API_KEY}"
+  model: "gpt-4-turbo-preview"
+  max_tokens: 4096
+  temperature: 0.3
+
+# Playwright Configuration
+playwright:
+  browser: "chromium"
+  viewport:
+    width: 1920
+    height: 1080
+  timeout: 30000
+  action_timeout: 5000
+
+# MCP Configuration
+mcp:
+  server_url: "http://localhost:3000"
+  timeout: 10000
+
+# Testing Configuration
+testing:
+  max_steps: 200
+  max_depth: 10
+  screenshot_on_error: true
+  screenshot_on_action: true
+  hidden_menu_expander: true
+  deep_traversal: true
+  path_discovery_boost: 1
+  form_validation_pass: true
+
+# Cost Guardrails
+cost:
+  max_llm_calls: 500
+  max_llm_tokens: 100000
+  estimated_cost_per_1k_tokens: 0.01
+
+# Report Configuration
+report:
+  template_dir: "src/webqa_plus/reporter"
+  output_format: "pdf"
+  include_screenshots: true
+  include_console_logs: true
+  include_network_logs: true
+
+# Visual Mode Settings
+visual:
+  overlay_position: "top-right"
+  overlay_opacity: 0.9
+  update_interval_ms: 100

@@ -1,0 +1,6 @@
+testing:
+  path_discovery_boost: 2
+  deep_traversal: true
+  hidden_menu_expander: true
+  form_validation_pass: true
+  email_verification_enabled: false
