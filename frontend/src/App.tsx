@@ -18,25 +18,21 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 
-type Provider = {
-  id: string;
-  name: string;
-  icon: string;
-  description: string;
-  default_model: string;
-  env_var: string;
-};
+const GEMINI_PROVIDER = "gemini";
 
-type Model = {
-  id: string;
-  name: string;
-};
+const GEMINI_MODELS = [
+  { id: "gemini-2.0-flash", name: "Gemini 2.0 Flash" },
+  { id: "gemini-2.0-flash-lite", name: "Gemini 2.0 Flash Lite" },
+  { id: "gemini-2.5-pro-preview-03-25", name: "Gemini 2.5 Pro Preview" },
+  { id: "gemini-1.5-pro", name: "Gemini 1.5 Pro" },
+  { id: "gemini-1.5-flash", name: "Gemini 1.5 Flash" },
+];
 
 type LogEntry = {
   ts?: string;
@@ -55,6 +51,7 @@ type TestStatus = {
   logs: LogEntry[];
   errors: string[];
   debug_errors?: string[];
+  current_objective?: string;
 };
 
 type ReportItem = {
@@ -64,10 +61,9 @@ type ReportItem = {
 };
 
 function App() {
-  const [providers, setProviders] = useState<Provider[]>([]);
-  const [models, setModels] = useState<Model[]>([]);
-  const [selectedProvider, setSelectedProvider] = useState("");
+  const [models, setModels] = useState(GEMINI_MODELS);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [steerInstruction, setSteerInstruction] = useState("");
   const [reports, setReports] = useState<ReportItem[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [testStatus, setTestStatus] = useState<TestStatus>({
@@ -83,13 +79,13 @@ function App() {
   });
 
   const [form, setForm] = useState({
-    api_key:
-      "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",
-    model: "",
+    api_key: "",
+    model: "gemini-2.0-flash",
     url: "https://app.aptlyflow.xyz",
-    auth_enabled: true,
-    auth_email: "olawalle94@gmail.com",
-    auth_password: "Olawalle1234@",
+    test_instruction: "",
+    auth_enabled: false,
+    auth_email: "",
+    auth_password: "",
     max_tokens: 4096,
     temperature: 0.3,
     mode: "stealth",
@@ -97,6 +93,7 @@ function App() {
     max_steps: 200,
     screenshot_on_error: true,
     screenshot_on_action: true,
+    dom_exploration_enabled: true,
     hidden_menu_expander: true,
     deep_traversal: true,
     path_discovery_boost: 1,
@@ -110,8 +107,7 @@ function App() {
 
   const isRunning =
     testStatus.status === "running" || testStatus.status === "pending";
-  const canStart =
-    !!selectedProvider && !!form.api_key && !!form.model && !!form.url;
+  const canStart = !!form.api_key && !!form.model && !!form.url;
 
   const statusVariant = useMemo(() => {
     if (testStatus.status === "completed") return "success";
@@ -123,14 +119,13 @@ function App() {
   const latestReport = useMemo(() => reports[0] ?? null, [reports]);
 
   useEffect(() => {
-    void loadProviders();
     void loadReports();
   }, []);
 
   useEffect(() => {
-    if (!selectedProvider) return;
-    void loadModels();
-  }, [selectedProvider]);
+    // Dynamically fetch Gemini models when the API key is available
+    if (form.api_key) void loadModels();
+  }, [form.api_key]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -162,29 +157,28 @@ function App() {
     return () => ws.close();
   }, [sessionId]);
 
-  async function loadProviders() {
-    const response = await fetch("/api/providers");
-    const data = await response.json();
-    setProviders(data.providers || []);
-    if (!selectedProvider && data.providers?.length) {
-      setSelectedProvider(data.providers[0].id);
-    }
-  }
-
   async function loadModels() {
     const query = form.api_key
       ? `?api_key=${encodeURIComponent(form.api_key)}`
       : "";
-    const response = await fetch(`/api/models/${selectedProvider}${query}`);
-    const data = await response.json();
-    const nextModels = data.models || [];
-    setModels(nextModels);
-    setForm((prev) => {
-      const stillValid = nextModels.some((m: Model) => m.id === prev.model);
-      if (stillValid) return prev;
-      const defaultModel = data.default_model || nextModels[0]?.id || "";
-      return { ...prev, model: defaultModel };
-    });
+    try {
+      const response = await fetch(`/api/models/${GEMINI_PROVIDER}${query}`);
+      const data = await response.json();
+      const nextModels = data.models?.length ? data.models : GEMINI_MODELS;
+      setModels(nextModels);
+      setForm((prev) => {
+        const stillValid = nextModels.some(
+          (m: { id: string }) => m.id === prev.model,
+        );
+        if (stillValid) return prev;
+        return {
+          ...prev,
+          model: data.default_model || nextModels[0]?.id || "gemini-2.0-flash",
+        };
+      });
+    } catch {
+      // keep static list on network error
+    }
   }
 
   async function loadReports() {
@@ -203,7 +197,7 @@ function App() {
       },
     ]);
     const payload = {
-      provider: selectedProvider,
+      provider: GEMINI_PROVIDER,
       ...form,
       headless: form.mode === "stealth",
       output_dir: "./reports",
@@ -219,12 +213,35 @@ function App() {
       return;
     }
     setSessionId(data.session_id);
+    setSteerInstruction(form.test_instruction || "");
     setTestStatus((prev) => ({ ...prev, status: "running" }));
   }
 
   async function stopTest() {
     if (!sessionId) return;
     await fetch(`/api/test/${sessionId}/stop`, { method: "POST" });
+  }
+
+  async function steerRunningTest() {
+    if (!sessionId || !steerInstruction.trim()) return;
+    const response = await fetch(`/api/test/${sessionId}/directive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction: steerInstruction.trim() }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      alert(data.error || "Failed to send directive");
+      return;
+    }
+    setLogs((prev) => [
+      ...prev,
+      {
+        level: "info",
+        message: `Directive updated: ${steerInstruction.trim()}`,
+        ts: new Date().toISOString(),
+      },
+    ]);
   }
 
   const update = (key: keyof typeof form, value: string | number | boolean) => {
@@ -236,9 +253,12 @@ function App() {
       <div className="mx-auto max-w-7xl space-y-6">
         <div className="flex items-center justify-between rounded-xl border bg-white/80 p-5 shadow-sm backdrop-blur">
           <div>
-            <h1 className="text-2xl font-bold">WebQA Plus Dashboard</h1>
+            <h1 className="text-2xl font-bold flex items-center gap-2">
+              ✨ WebQA Plus — Powered by Gemini
+            </h1>
             <p className="text-sm text-muted-foreground">
-              React + HMR + shadcn + Tailwind migration in progress
+              Multimodal AI visual QA tester &bull; Google Gemini Live Agent
+              Challenge
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -275,20 +295,7 @@ function App() {
             <CardContent className="space-y-4">
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
-                  <Label>Provider</Label>
-                  <Select
-                    value={selectedProvider}
-                    onChange={(e) => setSelectedProvider(e.target.value)}
-                  >
-                    {providers.map((provider) => (
-                      <option key={provider.id} value={provider.id}>
-                        {provider.icon} {provider.name}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <Label>Model</Label>
+                  <Label>Gemini Model</Label>
                   <Select
                     value={form.model}
                     onChange={(e) => update("model", e.target.value)}
@@ -300,26 +307,48 @@ function App() {
                     ))}
                   </Select>
                 </div>
-              </div>
-
-              <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
-                  <Label>API Key</Label>
+                  <Label>Google API Key</Label>
                   <Input
                     type="password"
+                    placeholder="AIza..."
                     value={form.api_key}
                     onChange={(e) => update("api_key", e.target.value)}
                     onBlur={() => void loadModels()}
                   />
+                  <p className="text-xs text-muted-foreground">
+                    Get yours free at{" "}
+                    <a
+                      href="https://aistudio.google.com/apikey"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline"
+                    >
+                      aistudio.google.com
+                    </a>
+                  </p>
                 </div>
-                <div className="space-y-2">
-                  <Label>Target URL</Label>
-                  <Input
-                    value={form.url}
-                    onChange={(e) => update("url", e.target.value)}
-                    placeholder="https://example.com"
-                  />
-                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Target URL</Label>
+                <Input
+                  value={form.url}
+                  onChange={(e) => update("url", e.target.value)}
+                  placeholder="https://example.com"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>What should be tested?</Label>
+                <Input
+                  value={form.test_instruction}
+                  onChange={(e) => update("test_instruction", e.target.value)}
+                  placeholder="e.g. Test signup + forgot password and verify validation errors"
+                />
+                <p className="text-xs text-muted-foreground">
+                  This directs agent priorities during exploration and testing.
+                </p>
               </div>
 
               <div className="grid gap-4 md:grid-cols-3">
@@ -357,9 +386,9 @@ function App() {
               </div>
 
               <div className="flex items-center gap-2">
-                <Checkbox
+                <Switch
                   checked={form.auth_enabled}
-                  onChange={(e) => update("auth_enabled", e.target.checked)}
+                  onCheckedChange={(checked) => update("auth_enabled", checked)}
                 />
                 <Label className="flex items-center gap-1">
                   <Shield className="h-4 w-4" /> Enable auth form credentials
@@ -368,26 +397,37 @@ function App() {
 
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="flex items-center gap-2">
-                  <Checkbox
+                  <Switch
+                    checked={form.dom_exploration_enabled}
+                    onCheckedChange={(checked) =>
+                      update("dom_exploration_enabled", checked)
+                    }
+                  />
+                  <Label>Enable DOM-based exploration</Label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Switch
                     checked={form.hidden_menu_expander}
-                    onChange={(e) =>
-                      update("hidden_menu_expander", e.target.checked)
+                    onCheckedChange={(checked) =>
+                      update("hidden_menu_expander", checked)
                     }
                   />
                   <Label>Run hidden-menu expander pass</Label>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Checkbox
+                  <Switch
                     checked={form.deep_traversal}
-                    onChange={(e) => update("deep_traversal", e.target.checked)}
+                    onCheckedChange={(checked) =>
+                      update("deep_traversal", checked)
+                    }
                   />
                   <Label>Enable deep intent traversal</Label>
                 </div>
                 <div className="flex items-center gap-2">
-                  <Checkbox
+                  <Switch
                     checked={form.form_validation_pass}
-                    onChange={(e) =>
-                      update("form_validation_pass", e.target.checked)
+                    onCheckedChange={(checked) =>
+                      update("form_validation_pass", checked)
                     }
                   />
                   <Label>Run form validation pass</Label>
@@ -408,10 +448,10 @@ function App() {
                   />
                 </div>
                 <div className="flex items-center gap-2 md:col-span-2">
-                  <Checkbox
+                  <Switch
                     checked={form.email_verification_enabled}
-                    onChange={(e) =>
-                      update("email_verification_enabled", e.target.checked)
+                    onCheckedChange={(checked) =>
+                      update("email_verification_enabled", checked)
                     }
                   />
                   <Label>
@@ -503,6 +543,21 @@ function App() {
                   disabled={!canStart || isRunning}
                 >
                   <RefreshCw className="h-4 w-4" /> Re-run
+                </Button>
+              </div>
+
+              <div className="grid gap-2 md:grid-cols-[1fr_auto]">
+                <Input
+                  value={steerInstruction}
+                  onChange={(e) => setSteerInstruction(e.target.value)}
+                  placeholder="While running: steer the test (e.g. verify booking flow errors)"
+                />
+                <Button
+                  variant="outline"
+                  disabled={!isRunning || !steerInstruction.trim()}
+                  onClick={steerRunningTest}
+                >
+                  Update Directive
                 </Button>
               </div>
             </CardContent>

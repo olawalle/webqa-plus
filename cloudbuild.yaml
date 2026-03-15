@@ -1,0 +1,55 @@
+# Google Cloud Build — WebQA-Plus Cloud Run deployment
+# Usage: gcloud builds submit --config cloudbuild.yaml
+#
+# Required substitutions (set in Cloud Build trigger or pass via --substitutions):
+#   _SERVICE_NAME  : Cloud Run service name (default: webqa-plus)
+#   _REGION        : Deployment region         (default: us-central1)
+#   _PROJECT_ID    : GCP project ID
+
+substitutions:
+  _SERVICE_NAME: webqa-plus
+  _REGION: us-central1
+  _IMAGE: gcr.io/$PROJECT_ID/${_SERVICE_NAME}
+
+steps:
+  # 1. Build the container image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - --tag
+      - ${_IMAGE}:${COMMIT_SHA}
+      - --tag
+      - ${_IMAGE}:latest
+      - .
+
+  # 2. Push image to Container Registry
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - --all-tags
+      - ${_IMAGE}
+
+  # 3. Deploy to Cloud Run
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image=${_IMAGE}:${COMMIT_SHA}
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --port=8080
+      - --memory=2Gi
+      - --cpu=2
+      - --timeout=3600
+      - --set-env-vars=PORT=8080
+      - --update-secrets=GOOGLE_API_KEY=webqa-google-api-key:latest
+
+images:
+  - ${_IMAGE}:${COMMIT_SHA}
+  - ${_IMAGE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

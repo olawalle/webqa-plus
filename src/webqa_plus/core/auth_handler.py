@@ -52,6 +52,8 @@ class AuthHandler:
         if not self.enabled or not self.email or not self.password:
             return False
 
+        original_url = page.url
+
         # Detect if this is a login page
         is_login_page = await self._is_login_page(page)
 
@@ -63,14 +65,27 @@ class AuthHandler:
         if is_authenticated:
             return True
 
-        # Look for login link/button
+        # If not on a login page and no clear login entrypoint exists, avoid forcing auth flows.
         login_link = await self._find_login_link(page)
-        if login_link:
-            await login_link.click()
-            await page.wait_for_load_state("networkidle")
-            return await self._perform_login(page)
+        if not login_link:
+            return True
 
-        return False
+        # Look for login link/button
+        try:
+            await login_link.click()
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+
+        # If we never navigated into an auth surface, skip intrusive auth attempts.
+        current_url = page.url.lower()
+        if current_url == original_url.lower() and not await self._is_login_page(page):
+            return True
+
+        return await self._perform_login(page)
 
     async def _is_login_page(self, page: Page) -> bool:
         """Detect if current page is a login page."""
@@ -154,7 +169,13 @@ class AuthHandler:
                 await password_field.press("Enter")
 
             # Wait for navigation
-            await page.wait_for_load_state("networkidle")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
 
             # Check if login succeeded
             return await self._check_authenticated(page)
@@ -187,9 +208,9 @@ class AuthHandler:
             except:
                 continue
 
-        # Check if login form is gone
+        # If this is not a login page anymore, treat as authenticated enough to proceed.
         is_login = await self._is_login_page(page)
-        if not is_login and page.url != page.url:  # Page changed
+        if not is_login:
             return True
 
         return False

@@ -23,6 +23,24 @@ class ObjectivesConfig(BaseModel):
     objectives: List[Objective]
 
 
+def directive_to_objectives(instruction: str) -> Dict[str, Any]:
+    """Convert free text directive into internal objectives structure."""
+    text = instruction.strip()
+    return {
+        "objectives": [
+            {
+                "name": "User directed objective",
+                "description": text,
+                "critical_paths": [],
+                "required_elements": [],
+                "priority": 1,
+                "strict": False,
+                "dynamic": True,
+            }
+        ]
+    }
+
+
 def load_objectives(path: Path) -> Dict[str, Any]:
     """Load custom testing objectives from YAML file."""
     with open(path, "r") as f:

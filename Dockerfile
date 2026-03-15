@@ -92,12 +92,12 @@ RUN playwright install chromium
 RUN useradd -m -u 1000 webqa && chown -R webqa:webqa /app
 USER webqa
 
-# Expose port (for potential web interface)
+# Expose port (Cloud Run uses PORT env var, defaults to 8080)
 EXPOSE 8080
 
-# Default command
+# Default: launch the web server (Cloud Run compatible)
 ENTRYPOINT ["webqa-plus"]
-CMD ["--help"]
+CMD ["web", "--host", "0.0.0.0", "--port", "8080"]
 
 # Labels
 LABEL maintainer="WebQA-Plus Team"

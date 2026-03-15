@@ -1,0 +1,15 @@
+# Files to exclude from Cloud Build context
+.git/
+.gitignore
+frontend/node_modules/
+frontend/dist/
+reports/
+benchmarks/
+__pycache__/
+*.pyc
+*.pyo
+.env
+config.yaml
+*.egg-info/
+.venv/
+.uv/

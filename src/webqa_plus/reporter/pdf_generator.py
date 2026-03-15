@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 from jinja2 import Environment, FileSystemLoader
 
 from webqa_plus.utils.config import AppConfig
+from webqa_plus.utils.weasyprint_env import configure_weasyprint_env
 
 
 class PDFReportGenerator:
@@ -37,6 +38,7 @@ class PDFReportGenerator:
         html_path.write_text(html_content)
 
         try:
+            configure_weasyprint_env()
             from weasyprint import CSS, HTML
         except Exception:
             return html_path
@@ -57,6 +59,13 @@ class PDFReportGenerator:
         test_results = [self._as_dict(item) for item in test_results_raw]
         flows_raw = state.get("discovered_flows", [])
         flows = [self._as_dict(item) for item in flows_raw]
+        step_visuals = state.get("artifacts", {}).get("step_visuals", {})
+
+        for result in test_results:
+            step_number = result.get("step_number")
+            visual_entry = step_visuals.get(str(step_number)) or step_visuals.get(step_number)
+            if isinstance(visual_entry, dict):
+                result["visuals"] = self._normalize_visual_paths(visual_entry)
 
         # Calculate metrics
         total_steps = len(test_results)
@@ -109,6 +118,27 @@ class PDFReportGenerator:
             except Exception:
                 pass
         return {}
+
+    def _normalize_visual_paths(self, visuals: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert local image paths into file URIs for report rendering."""
+        normalized: Dict[str, Any] = {}
+        image_fields = {
+            "before_full",
+            "before_crop",
+            "after_full",
+            "after_crop",
+            "annotated_failure",
+        }
+        for key, value in visuals.items():
+            if key in image_fields and isinstance(value, str) and value.strip():
+                path = Path(value)
+                if path.exists():
+                    normalized[key] = path.resolve().as_uri()
+                else:
+                    normalized[key] = value
+            else:
+                normalized[key] = value
+        return normalized
 
     def _get_css(self) -> str:
         """Get CSS styles for PDF."""

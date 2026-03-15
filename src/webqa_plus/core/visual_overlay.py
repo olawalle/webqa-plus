@@ -1,5 +1,6 @@
 """Visual overlay injection for visual mode."""
 
+import html
 import json
 from typing import Any, Dict, List, Optional
 
@@ -10,7 +11,7 @@ OVERLAY_CSS = """
 /* WebQA-Plus Overlay Styles */
 #webqa-plus-overlay {
     position: fixed;
-    top: 10px;
+    bottom: 10px;
     right: 10px;
     width: 320px;
     background: rgba(30, 30, 40, 0.95);
@@ -23,8 +24,8 @@ OVERLAY_CSS = """
     z-index: 2147483647;
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
     backdrop-filter: blur(10px);
-    pointer-events: none;
-    user-select: none;
+    pointer-events: auto;
+    user-select: text;
     max-height: 400px;
     overflow-y: auto;
     display: block !important;
@@ -35,10 +36,41 @@ OVERLAY_CSS = """
 #webqa-plus-overlay .header {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: space-between;
     margin-bottom: 12px;
     padding-bottom: 8px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+#webqa-plus-overlay .header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#webqa-plus-overlay .collapse-button {
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #e5e7eb;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+#webqa-plus-overlay .overlay-body {
+    display: block;
+}
+
+#webqa-plus-overlay.collapsed .overlay-body {
+    display: none;
+}
+
+#webqa-plus-overlay.collapsed {
+    width: 210px;
+    max-height: 80px;
+    overflow: hidden;
 }
 
 #webqa-plus-overlay .logo {
@@ -61,6 +93,81 @@ OVERLAY_CSS = """
 #webqa-plus-overlay .status {
     font-size: 13px;
     margin-bottom: 12px;
+}
+
+#webqa-plus-overlay .phase {
+    font-size: 12px;
+    color: #93c5fd;
+    margin-top: 4px;
+}
+
+#webqa-plus-overlay .objective {
+    font-size: 12px;
+    color: #d1d5db;
+    margin-top: 8px;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+#webqa-plus-overlay .directive-panel {
+    margin-top: 10px;
+    padding: 10px;
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.55);
+    border: 1px solid rgba(59, 130, 246, 0.22);
+}
+
+#webqa-plus-overlay .directive-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+#webqa-plus-overlay .directive-input {
+    flex: 1;
+    min-width: 0;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.08);
+    color: #f8fafc;
+    padding: 8px 10px;
+    font-size: 12px;
+    outline: none;
+}
+
+#webqa-plus-overlay .directive-input::placeholder {
+    color: #94a3b8;
+}
+
+#webqa-plus-overlay .directive-input:focus {
+    border-color: rgba(96, 165, 250, 0.8);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+#webqa-plus-overlay .directive-button {
+    border: 0;
+    border-radius: 6px;
+    background: linear-gradient(135deg, #2563eb, #0ea5e9);
+    color: #ffffff;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+#webqa-plus-overlay .directive-button:disabled {
+    opacity: 0.65;
+    cursor: wait;
+}
+
+#webqa-plus-overlay .directive-status {
+    margin-top: 8px;
+    min-height: 16px;
+    font-size: 11px;
+    color: #93c5fd;
 }
 
 #webqa-plus-overlay .flow-name {
@@ -227,12 +334,27 @@ OVERLAY_CSS = """
 OVERLAY_HTML_TEMPLATE = """
 <div id="webqa-plus-overlay">
     <div class="header">
-        <div class="logo">🧪</div>
-        <div class="title">WebQA-Plus</div>
+        <div class="header-left">
+            <div class="logo">🧪</div>
+            <div class="title">WebQA-Plus</div>
+        </div>
+        <button id="webqa-plus-collapse-toggle" class="collapse-button" type="button" aria-expanded="true">Collapse</button>
     </div>
-    
+
+    <div class="overlay-body" id="webqa-plus-overlay-body">
     <div class="status">
         Currently testing: <span class="flow-name" id="current-flow">{flow_name}</span>
+        <div class="phase">Phase: <span id="current-phase">{current_phase}</span></div>
+    </div>
+
+    <div class="objective" id="objective-text">{objective_text}</div>
+    <div class="directive-panel">
+        <div class="section-title">Steer Test Live</div>
+        <div class="directive-row">
+            <input id="webqa-plus-directive-input" class="directive-input" type="text" placeholder="Tell the agent what to test next" value="{directive_value}" />
+            <button id="webqa-plus-directive-button" class="directive-button" type="button">Update</button>
+        </div>
+        <div class="directive-status" id="directive-status">Update the objective without leaving this page.</div>
     </div>
     
     <div class="progress-container">
@@ -271,6 +393,7 @@ OVERLAY_HTML_TEMPLATE = """
     </div>
     
     <div class="action-log" id="action-log"></div>
+    </div>
 </div>
 """
 
@@ -283,6 +406,76 @@ class VisualOverlay:
         self.config = config
         self.is_visible = False
         self._init_script_installed = False
+        self._latest_state: Dict[str, Any] = {
+            "flow_name": "Initializing...",
+            "current_phase": "idle",
+            "objective_text": "No objective set.",
+            "current_step": 0,
+            "max_steps": 100,
+            "completed_flows": [],
+            "upcoming_flows": [],
+            "url_count": 0,
+            "coverage": 0.0,
+        }
+
+    def _set_latest_state(
+        self,
+        *,
+        flow_name: str,
+        current_phase: str,
+        objective_text: str,
+        current_step: int,
+        max_steps: int,
+        completed_flows: List[str],
+        upcoming_flows: List[str],
+        url_count: int,
+        coverage: float,
+    ) -> None:
+        """Cache the latest overlay payload so reinjection stays live."""
+        self._latest_state = {
+            "flow_name": flow_name,
+            "current_phase": current_phase,
+            "objective_text": objective_text,
+            "current_step": current_step,
+            "max_steps": max_steps,
+            "completed_flows": list(completed_flows),
+            "upcoming_flows": list(upcoming_flows),
+            "url_count": url_count,
+            "coverage": coverage,
+        }
+
+    def _render_latest_overlay(self) -> str:
+        """Render overlay HTML from cached state."""
+        return self._render_overlay(**self._latest_state)
+
+    def _latest_js_state(self) -> Dict[str, Any]:
+        """Build the browser-side overlay state payload."""
+        return {
+            "flowName": self._latest_state.get("flow_name", "Initializing..."),
+            "currentPhase": self._latest_state.get("current_phase", "idle"),
+            "objective": self._latest_state.get("objective_text", ""),
+            "currentStep": self._latest_state.get("current_step", 0),
+            "maxSteps": self._latest_state.get("max_steps", 100),
+            "completedFlows": list(self._latest_state.get("completed_flows", [])),
+            "upcomingFlows": list(self._latest_state.get("upcoming_flows", [])),
+            "urlCount": self._latest_state.get("url_count", 0),
+            "coverage": self._latest_state.get("coverage", 0),
+            "collapsed": False,
+            "actions": [],
+        }
+
+    def _overlay_position(self) -> str:
+        """Return validated overlay position value."""
+        position = str(self.config.get("overlay_position", "bottom-right")).strip().lower()
+        return position if position in {"top-right", "top-left", "bottom-right", "bottom-left"} else "bottom-right"
+
+    def _overlay_opacity(self) -> float:
+        """Return clamped overlay opacity."""
+        try:
+            value = float(self.config.get("overlay_opacity", 0.9))
+        except Exception:
+            value = 0.9
+        return max(0.25, min(1.0, value))
 
     async def _install_init_script(self, page: Page, initial_html: str) -> None:
         """Install init script so overlay is re-injected on every navigation."""
@@ -291,6 +484,9 @@ class VisualOverlay:
 
         css = json.dumps(OVERLAY_CSS)
         html = json.dumps(initial_html)
+        state = json.dumps(self._latest_js_state())
+        position = json.dumps(self._overlay_position())
+        opacity = self._overlay_opacity()
         await page.context.add_init_script(
             script=f"""
                 (() => {{
@@ -300,8 +496,130 @@ class VisualOverlay:
                     const POINTER_CLICK_ID = 'webqa-plus-pointer-click';
                     const overlayCss = {css};
                     const overlayHtml = {html};
+                    const overlayState = {state};
+                    const overlayPosition = {position};
+                    const overlayOpacity = {opacity};
                     const STATE_KEY = '__webqa_overlay_observer__';
                     const POINTER_STATE_KEY = '__webqa_overlay_pointer_bound__';
+
+                    const applyOverlayPosition = (overlay) => {{
+                        if (!overlay) return;
+                        overlay.style.top = 'auto';
+                        overlay.style.bottom = 'auto';
+                        overlay.style.left = 'auto';
+                        overlay.style.right = 'auto';
+
+                        if (overlayPosition === 'top-left') {{
+                            overlay.style.top = '10px';
+                            overlay.style.left = '10px';
+                        }} else if (overlayPosition === 'top-right') {{
+                            overlay.style.top = '10px';
+                            overlay.style.right = '10px';
+                        }} else if (overlayPosition === 'bottom-left') {{
+                            overlay.style.bottom = '10px';
+                            overlay.style.left = '10px';
+                        }} else {{
+                            overlay.style.bottom = '10px';
+                            overlay.style.right = '10px';
+                        }}
+                        overlay.style.opacity = String(overlayOpacity);
+                    }};
+
+                    const installDirectiveControls = () => {{
+                        const input = document.getElementById('webqa-plus-directive-input');
+                        const button = document.getElementById('webqa-plus-directive-button');
+                        const status = document.getElementById('directive-status');
+                        const objectiveEl = document.getElementById('objective-text');
+
+                        if (!input || !button || !status) return;
+                        if (button.dataset.bound === 'true') return;
+
+                        const setStatus = (message) => {{
+                            status.textContent = message;
+                        }};
+
+                        const submitDirective = async () => {{
+                            const instruction = input.value.trim();
+                            if (!instruction) {{
+                                setStatus('Enter a directive first.');
+                                input.focus();
+                                return;
+                            }}
+
+                            if (typeof window.webqaPlusUpdateDirective !== 'function') {{
+                                setStatus('Live steering is unavailable on this run.');
+                                return;
+                            }}
+
+                            button.disabled = true;
+                            setStatus('Updating objective...');
+
+                            try {{
+                                const result = await window.webqaPlusUpdateDirective(instruction);
+                                if (result && result.ok === false) {{
+                                    throw new Error(result.error || 'Failed to update objective.');
+                                }}
+
+                                window.webqaState = window.webqaState || {{ actions: [] }};
+                                window.webqaState.objective = instruction;
+                                if (objectiveEl) objectiveEl.textContent = instruction;
+                                setStatus('Objective updated.');
+                            }} catch (error) {{
+                                const message = error && error.message ? error.message : 'Directive update failed.';
+                                setStatus(message);
+                            }} finally {{
+                                button.disabled = false;
+                            }}
+                        }};
+
+                        button.addEventListener('click', (event) => {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void submitDirective();
+                        }});
+
+                        input.addEventListener('keydown', (event) => {{
+                            if (event.key !== 'Enter') return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void submitDirective();
+                        }});
+
+                        if (!input.value && window.webqaState && window.webqaState.objective) {{
+                            input.value = window.webqaState.objective;
+                        }}
+
+                        button.dataset.bound = 'true';
+                    }};
+
+                    const installCollapseControls = () => {{
+                        const overlay = document.getElementById(OVERLAY_ID);
+                        const toggle = document.getElementById('webqa-plus-collapse-toggle');
+                        if (!overlay || !toggle) return;
+                        if (toggle.dataset.bound === 'true') return;
+
+                        const applyState = () => {{
+                            const collapsed = overlay.classList.contains('collapsed');
+                            toggle.textContent = collapsed ? 'Expand' : 'Collapse';
+                            toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+                        }};
+
+                        if (window.webqaState && window.webqaState.collapsed) {{
+                            overlay.classList.add('collapsed');
+                        }}
+
+                        toggle.addEventListener('click', (event) => {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            overlay.classList.toggle('collapsed');
+                            window.webqaState = window.webqaState || {{ actions: [] }};
+                            window.webqaState.collapsed = overlay.classList.contains('collapsed');
+                            applyState();
+                        }});
+
+                        applyState();
+                        toggle.dataset.bound = 'true';
+                    }};
 
                     const ensureOverlay = () => {{
                         if (!document.head) return;
@@ -334,23 +652,17 @@ class VisualOverlay:
 
                         const overlay = document.getElementById(OVERLAY_ID);
                         if (overlay) {{
+                            applyOverlayPosition(overlay);
                             overlay.style.display = 'block';
                             overlay.style.visibility = 'visible';
-                            overlay.style.opacity = '1';
                         }}
 
                         if (!window.webqaState) {{
-                            window.webqaState = {{
-                                flowName: 'Initializing...',
-                                currentStep: 0,
-                                maxSteps: 100,
-                                completedFlows: [],
-                                upcomingFlows: [],
-                                urlCount: 0,
-                                coverage: 0,
-                                actions: []
-                            }};
+                            window.webqaState = {{ ...overlayState }};
                         }}
+
+                        installDirectiveControls();
+                        installCollapseControls();
                     }};
 
                     const installObserver = () => {{
@@ -410,21 +722,17 @@ class VisualOverlay:
 
     async def inject(self, page: Page) -> None:
         """Inject the overlay into the page."""
-        # Add initial HTML
-        initial_html = self._render_overlay(
-            flow_name="Initializing...",
-            current_step=0,
-            max_steps=100,
-            completed_flows=[],
-            upcoming_flows=[],
-            url_count=0,
-            coverage=0.0,
-        )
+        # Add latest HTML so reinjection reflects current live state.
+        initial_html = self._render_latest_overlay()
 
         await self._install_init_script(page, initial_html)
 
         # Add CSS
         await page.add_style_tag(content=OVERLAY_CSS)
+
+        browser_state = json.dumps(self._latest_js_state())
+        overlay_position = self._overlay_position()
+        overlay_opacity = self._overlay_opacity()
 
         await page.evaluate(f"""
             (() => {{
@@ -438,16 +746,122 @@ class VisualOverlay:
                 document.body.appendChild(div.firstElementChild);
                 
                 // Store state globally
-                window.webqaState = {{
-                    flowName: 'Initializing...',
-                    currentStep: 0,
-                    maxSteps: 100,
-                    completedFlows: [],
-                    upcomingFlows: [],
-                    urlCount: 0,
-                    coverage: 0,
-                    actions: []
+                const previousActions = Array.isArray(window.webqaState?.actions)
+                    ? window.webqaState.actions
+                    : [];
+                const previousCollapsed = Boolean(window.webqaState?.collapsed);
+                window.webqaState = {{ ...{browser_state}, actions: previousActions }};
+                window.webqaState.collapsed = previousCollapsed;
+
+                const overlay = document.getElementById('webqa-plus-overlay');
+                if (overlay) {{
+                    overlay.style.top = 'auto';
+                    overlay.style.bottom = 'auto';
+                    overlay.style.left = 'auto';
+                    overlay.style.right = 'auto';
+                    if ({json.dumps(overlay_position)} === 'top-left') {{
+                        overlay.style.top = '10px';
+                        overlay.style.left = '10px';
+                    }} else if ({json.dumps(overlay_position)} === 'top-right') {{
+                        overlay.style.top = '10px';
+                        overlay.style.right = '10px';
+                    }} else if ({json.dumps(overlay_position)} === 'bottom-left') {{
+                        overlay.style.bottom = '10px';
+                        overlay.style.left = '10px';
+                    }} else {{
+                        overlay.style.bottom = '10px';
+                        overlay.style.right = '10px';
+                    }}
+                    overlay.style.opacity = String({overlay_opacity});
+                    if (window.webqaState.collapsed) {{
+                        overlay.classList.add('collapsed');
+                    }}
+                }}
+
+                const input = document.getElementById('webqa-plus-directive-input');
+                const button = document.getElementById('webqa-plus-directive-button');
+                const status = document.getElementById('directive-status');
+                const objectiveEl = document.getElementById('objective-text');
+                const collapseToggle = document.getElementById('webqa-plus-collapse-toggle');
+
+                const setStatus = (message) => {{
+                    if (status) status.textContent = message;
                 }};
+
+                const submitDirective = async () => {{
+                    const instruction = (input?.value || '').trim();
+                    if (!instruction) {{
+                        setStatus('Enter a directive first.');
+                        input?.focus();
+                        return;
+                    }}
+
+                    if (typeof window.webqaPlusUpdateDirective !== 'function') {{
+                        setStatus('Live steering is unavailable on this run.');
+                        return;
+                    }}
+
+                    if (button) button.disabled = true;
+                    setStatus('Updating objective...');
+
+                    try {{
+                        const result = await window.webqaPlusUpdateDirective(instruction);
+                        if (result && result.ok === false) {{
+                            throw new Error(result.error || 'Failed to update objective.');
+                        }}
+                        window.webqaState.objective = instruction;
+                        if (objectiveEl) objectiveEl.textContent = instruction;
+                        setStatus('Objective updated.');
+                    }} catch (error) {{
+                        const message = error && error.message ? error.message : 'Directive update failed.';
+                        setStatus(message);
+                    }} finally {{
+                        if (button) button.disabled = false;
+                    }}
+                }};
+
+                if (input && !input.value && window.webqaState.objective) {{
+                    input.value = window.webqaState.objective;
+                }}
+
+                if (button && button.dataset.bound !== 'true') {{
+                    button.addEventListener('click', (event) => {{
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void submitDirective();
+                    }});
+                    button.dataset.bound = 'true';
+                }}
+
+                if (input && input.dataset.bound !== 'true') {{
+                    input.addEventListener('keydown', (event) => {{
+                        if (event.key !== 'Enter') return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void submitDirective();
+                    }});
+                    input.dataset.bound = 'true';
+                }}
+
+                if (collapseToggle && collapseToggle.dataset.bound !== 'true') {{
+                    const refreshCollapseLabel = () => {{
+                        const isCollapsed = overlay?.classList.contains('collapsed');
+                        collapseToggle.textContent = isCollapsed ? 'Expand' : 'Collapse';
+                        collapseToggle.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+                    }};
+
+                    collapseToggle.addEventListener('click', (event) => {{
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (!overlay) return;
+                        overlay.classList.toggle('collapsed');
+                        window.webqaState.collapsed = overlay.classList.contains('collapsed');
+                        refreshCollapseLabel();
+                    }});
+
+                    refreshCollapseLabel();
+                    collapseToggle.dataset.bound = 'true';
+                }}
             }})();
         """)
 
@@ -457,6 +871,8 @@ class VisualOverlay:
         self,
         page: Page,
         flow_name: str,
+        current_phase: str,
+        objective_text: str,
         current_step: int,
         max_steps: int,
         completed_flows: List[str],
@@ -469,20 +885,30 @@ class VisualOverlay:
         if not self.is_visible:
             return
 
-        try:
-            await page.evaluate(
-                """
-                (() => {
-                    if (!document.getElementById('webqa-plus-overlay')) {
-                        throw new Error('overlay-missing');
-                    }
-                })();
-                """
-            )
+        self._set_latest_state(
+            flow_name=flow_name,
+            current_phase=current_phase,
+            objective_text=objective_text,
+            current_step=current_step,
+            max_steps=max_steps,
+            completed_flows=completed_flows,
+            upcoming_flows=upcoming_flows,
+            url_count=url_count,
+            coverage=coverage,
+        )
+
+        async def _apply_update() -> None:
             await page.evaluate(f"""
                 (() => {{
                     const overlay = document.getElementById('webqa-plus-overlay');
-                    if (!overlay) return;
+                    if (!overlay) {{
+                        throw new Error('overlay-missing');
+                    }}
+                    const phaseProbe = document.getElementById('current-phase');
+                    const directiveProbe = document.getElementById('webqa-plus-directive-input');
+                    if (!phaseProbe || !directiveProbe) {{
+                        throw new Error('overlay-stale-template');
+                    }}
 
                     if (!window.webqaState) {{
                         window.webqaState = {{ actions: [] }};
@@ -490,16 +916,35 @@ class VisualOverlay:
                     if (!Array.isArray(window.webqaState.actions)) {{
                         window.webqaState.actions = [];
                     }}
+                    window.webqaState.flowName = {json.dumps(flow_name)};
+                    window.webqaState.currentPhase = {json.dumps(current_phase)};
+                    window.webqaState.objective = {json.dumps(objective_text)};
+                    window.webqaState.currentStep = {current_step};
+                    window.webqaState.maxSteps = {max_steps};
+                    window.webqaState.completedFlows = {json.dumps(completed_flows)};
+                    window.webqaState.upcomingFlows = {json.dumps(upcoming_flows)};
+                    window.webqaState.urlCount = {url_count};
+                    window.webqaState.coverage = {coverage};
                     
                     // Update flow name
                     const flowEl = document.getElementById('current-flow');
                     if (flowEl) flowEl.textContent = {json.dumps(flow_name)};
+
+                    // Update phase + objective
+                    const phaseEl = document.getElementById('current-phase');
+                    if (phaseEl) phaseEl.textContent = {json.dumps(current_phase)};
+                    const objectiveEl = document.getElementById('objective-text');
+                    if (objectiveEl) objectiveEl.textContent = {json.dumps(objective_text)};
+                    const directiveInput = document.getElementById('webqa-plus-directive-input');
+                    if (directiveInput && document.activeElement !== directiveInput) {{
+                        directiveInput.value = {json.dumps(objective_text if objective_text != 'No objective set.' else '')};
+                    }}
                     
                     // Update progress
                     const progressText = document.getElementById('progress-text');
                     const progressBar = document.getElementById('progress-bar');
                     if (progressText) progressText.textContent = `{current_step}/{max_steps}`;
-                    if (progressBar) progressBar.style.width = `${{(current_step / max_steps) * 100}}%`;
+                    if (progressBar) progressBar.style.width = `${{max_steps > 0 ? (current_step / max_steps) * 100 : 0}}%`;
                     
                     // Update completed flows
                     const completedEl = document.getElementById('completed-flows');
@@ -538,9 +983,13 @@ class VisualOverlay:
                     }}
                 }})();
             """)
-        except Exception:
-            # Overlay might have been removed by page navigation; re-inject immediately.
-            await self.inject(page)
+
+        for _ in range(2):
+            try:
+                await _apply_update()
+                return
+            except Exception:
+                await self.inject(page)
 
     async def hide(self, page: Page) -> None:
         """Hide the overlay."""
@@ -574,6 +1023,8 @@ class VisualOverlay:
     def _render_overlay(
         self,
         flow_name: str,
+        current_phase: str,
+        objective_text: str,
         current_step: int,
         max_steps: int,
         completed_flows: List[str],
@@ -602,6 +1053,9 @@ class VisualOverlay:
 
         return OVERLAY_HTML_TEMPLATE.format(
             flow_name=flow_name,
+            current_phase=current_phase,
+            objective_text=objective_text,
+            directive_value=html.escape(objective_text if objective_text != "No objective set." else "", quote=True),
             current_step=current_step,
             max_steps=max_steps,
             progress_pct=progress_pct,

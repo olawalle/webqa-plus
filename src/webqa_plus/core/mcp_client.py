@@ -242,12 +242,16 @@ class MCPClient:
             popup_url = ""
             popup_validated = False
 
+            if action_type in {"click", "type", "clear", "select", "check", "uncheck", "hover"}:
+                await self._prepare_locator_for_action(page, locator)
+
             if action_type == "click":
                 try:
                     has_open_modal = await self._has_open_dialog_overlay(page)
                     if has_open_modal and not await self._is_locator_within_active_modal(locator):
                         await self._dismiss_blocking_overlays(page)
                         locator = await self._resolve_target_locator(page, target)
+                        await self._prepare_locator_for_action(page, locator)
                 except Exception:
                     pass
 
@@ -268,6 +272,7 @@ class MCPClient:
                     if "intercepts pointer events" in error_text:
                         await self._dismiss_blocking_overlays(page)
                         locator = await self._resolve_target_locator(page, target)
+                        await self._prepare_locator_for_action(page, locator)
                         try:
                             async with page.context.expect_page(timeout=2000) as popup_info:
                                 await locator.click(timeout=5000)
@@ -334,9 +339,94 @@ class MCPClient:
                 "trace": "\n".join(traceback.format_exception(type(e), e, e.__traceback__)[-6:]),
             }
 
+    async def _prepare_locator_for_action(self, page: Page, locator: Any) -> None:
+        """Best-effort visibility prep for actions, including scroll into view and viewport fallback."""
+        try:
+            if await locator.count() <= 0:
+                return
+        except Exception:
+            return
+
+        try:
+            await locator.first.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            if await locator.first.is_visible():
+                return
+        except Exception:
+            pass
+
+        try:
+            await locator.first.evaluate(
+                """
+                (el) => {
+                    if (!el) return;
+                    const findScrollableParent = (node) => {
+                        let parent = node?.parentElement;
+                        while (parent) {
+                            const style = window.getComputedStyle(parent);
+                            const overflowY = style.overflowY || '';
+                            const canScroll = ['auto', 'scroll', 'overlay'].includes(overflowY);
+                            if (canScroll && parent.scrollHeight > parent.clientHeight + 2) {
+                                return parent;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        return null;
+                    };
+
+                    const scrollParent = findScrollableParent(el);
+                    if (scrollParent) {
+                        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+                    }} else {
+                        el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+                    }
+                }
+                """
+            )
+            await page.wait_for_timeout(120)
+        except Exception:
+            pass
+
+        try:
+            if await locator.first.is_visible():
+                return
+        except Exception:
+            pass
+
+        viewport = page.viewport_size or {"height": 800}
+        step = int(max(350, min(1000, int(viewport.get("height", 800) * 0.85))))
+
+        for _ in range(6):
+            try:
+                await page.mouse.wheel(0, step)
+                await page.wait_for_timeout(90)
+            except Exception:
+                break
+            try:
+                if await locator.first.is_visible():
+                    return
+            except Exception:
+                continue
+
+        for _ in range(3):
+            try:
+                await page.mouse.wheel(0, -step)
+                await page.wait_for_timeout(90)
+            except Exception:
+                break
+            try:
+                if await locator.first.is_visible():
+                    return
+            except Exception:
+                continue
+
     async def _fill_with_fallback(self, page: Page, locator: Any, target: str, value: str) -> None:
         """Fill input with fallback strategies for unreliable selectors and auth fields."""
         try:
+            await self._prepare_locator_for_action(page, locator)
             try:
                 current_value = await locator.input_value(timeout=1500)
                 if current_value == value:
@@ -383,6 +473,7 @@ class MCPClient:
             try:
                 candidate = page.locator(selector).first
                 if await candidate.count() > 0 and await candidate.is_visible():
+                    await self._prepare_locator_for_action(page, candidate)
                     try:
                         current_value = await candidate.input_value(timeout=1500)
                         if current_value == value:
@@ -478,6 +569,7 @@ class MCPClient:
         self, page: Page, locator: Any, target: str, value: Optional[str]
     ) -> None:
         """Select option robustly, with auto-pick fallback for unknown values."""
+        await self._prepare_locator_for_action(page, locator)
         requested = (value or "").strip()
         if requested and requested != "__webqa_auto__":
             try:

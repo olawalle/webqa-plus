@@ -191,6 +191,62 @@
                 {% endfor %}
             </tbody>
         </table>
+
+        <h2>Visual Evidence</h2>
+        {% for result in test_results %}
+            {% if result.visuals %}
+                <div class="step-detail">
+                    <p>
+                        <strong>Step {{ result.step_number }}</strong> — {{ result.action }}
+                        {% if result.target %} on {{ result.target }}{% endif %}
+                    </p>
+
+                    {% if result.visuals.ocr %}
+                        <p>
+                            <strong>OCR Fallback:</strong>
+                            {{ result.visuals.ocr.summary or 'No summary provided' }}
+                            (confidence: {{ result.visuals.ocr.confidence or 'unknown' }})
+                        </p>
+                        {% if result.visuals.ocr.evidence_keywords %}
+                            <p><strong>OCR Evidence:</strong> {{ result.visuals.ocr.evidence_keywords | join(', ') }}</p>
+                        {% endif %}
+                    {% endif %}
+
+                    <div class="metrics-grid">
+                        {% if result.visuals.before_full %}
+                            <div class="metric-card" style="min-width: 260px; text-align: left;">
+                                <div class="metric-label">Before (Full)</div>
+                                <img class="screenshot" src="{{ result.visuals.before_full }}" alt="Step {{ result.step_number }} before full" />
+                            </div>
+                        {% endif %}
+                        {% if result.visuals.before_crop %}
+                            <div class="metric-card" style="min-width: 260px; text-align: left;">
+                                <div class="metric-label">Before (Target Crop)</div>
+                                <img class="screenshot" src="{{ result.visuals.before_crop }}" alt="Step {{ result.step_number }} before crop" />
+                            </div>
+                        {% endif %}
+                        {% if result.visuals.after_full %}
+                            <div class="metric-card" style="min-width: 260px; text-align: left;">
+                                <div class="metric-label">After (Full)</div>
+                                <img class="screenshot" src="{{ result.visuals.after_full }}" alt="Step {{ result.step_number }} after full" />
+                            </div>
+                        {% endif %}
+                        {% if result.visuals.after_crop %}
+                            <div class="metric-card" style="min-width: 260px; text-align: left;">
+                                <div class="metric-label">After (Target Crop)</div>
+                                <img class="screenshot" src="{{ result.visuals.after_crop }}" alt="Step {{ result.step_number }} after crop" />
+                            </div>
+                        {% endif %}
+                        {% if result.visuals.annotated_failure %}
+                            <div class="metric-card" style="min-width: 260px; text-align: left; border-color: #ef4444;">
+                                <div class="metric-label" style="color: #ef4444;">Annotated Failure</div>
+                                <img class="screenshot" src="{{ result.visuals.annotated_failure }}" alt="Step {{ result.step_number }} annotated failure" />
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            {% endif %}
+        {% endfor %}
     {% else %}
         <p>No test results recorded.</p>
     {% endif %}
