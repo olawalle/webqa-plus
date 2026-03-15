@@ -50,6 +50,7 @@ dependencies = [
 
 [project.scripts]
 webqa-plus = "webqa_plus.cli:main"
+webqa_plus = "webqa_plus.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yourusername/webqa-plus"

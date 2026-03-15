@@ -150,3 +150,6 @@ config.yaml
 .DS_Store
 test-results/
 playwright-results/
+
+# reports folder
+reports/
