@@ -1,20 +1,20 @@
 # WebQA-Plus Configuration
+# Powered by Gemini — Google's multimodal AI
 
-# LLM Provider Configuration (new unified format)
+# Gemini LLM Configuration
 llm:
-  provider: "openai"  # Options: openai, anthropic, openrouter
-  api_key: "${OPENAI_API_KEY}"
-  model: "gpt-4-turbo-preview"
+  provider: "gemini"
+  api_key: "${GOOGLE_API_KEY}"  # Get yours at https://aistudio.google.com/apikey
+  model: "gemini-2.0-flash"    # Options: gemini-2.0-flash, gemini-2.0-flash-lite, gemini-2.5-pro-preview-03-25
   max_tokens: 4096
   temperature: 0.3
-  # base_url: null  # Optional: custom API endpoint
+  multimodal: true              # Enables screenshot injection into prompts (vision-based QA)
+  vertex_ai: false              # Set true to use Vertex AI endpoint instead of AI Studio
 
-# Legacy OpenAI Configuration (deprecated, use 'llm' above)
-openai:
-  api_key: "${OPENAI_API_KEY}"
-  model: "gpt-4-turbo-preview"
-  max_tokens: 4096
-  temperature: 0.3
+# Google Cloud Configuration (for Cloud Run deployment)
+google_cloud:
+  project_id: "${GCP_PROJECT_ID}"
+  region: "us-central1"
 
 # Playwright Configuration
 playwright:
@@ -36,6 +36,7 @@ testing:
   max_depth: 10
   screenshot_on_error: true
   screenshot_on_action: true
+  dom_exploration_enabled: true
   hidden_menu_expander: true
   deep_traversal: true
   path_discovery_boost: 1
@@ -57,6 +58,6 @@ report:
 
 # Visual Mode Settings
 visual:
-  overlay_position: "top-right"
+  overlay_position: "bottom-right"
   overlay_opacity: 0.9
   update_interval_ms: 100

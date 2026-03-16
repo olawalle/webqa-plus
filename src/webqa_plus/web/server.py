@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 from webqa_plus.core.engine import TestEngine
 from webqa_plus.utils.config import AppConfig, load_config
-from webqa_plus.utils.llm_providers import LLMProvider, get_default_model_for_provider
+from webqa_plus.utils.llm_providers import get_default_model_for_provider
 
 # In-memory storage for test sessions
 test_sessions: Dict[str, Dict[str, Any]] = {}
@@ -167,6 +167,7 @@ class TestConfig(BaseModel):
 
     # Target URL
     url: str
+    test_instruction: Optional[str] = None
 
     # Authentication
     auth_enabled: bool = False
@@ -180,13 +181,14 @@ class TestConfig(BaseModel):
     headless: bool = True
     screenshot_on_error: bool = True
     screenshot_on_action: bool = True
+    dom_exploration_enabled: bool = True
     hidden_menu_expander: bool = True
     deep_traversal: bool = True
     path_discovery_boost: int = 1
     form_validation_pass: bool = True
     email_verification_enabled: bool = False
-    email_provider: str = "1secmail"
-    email_provider_base_url: str = "https://www.1secmail.com/api/v1/"
+    email_provider: str = "guerrillamail"
+    email_provider_base_url: str = "https://api.guerrillamail.com/ajax.php"
     email_poll_timeout_seconds: int = 120
     email_poll_interval_seconds: int = 5
     email_request_timeout_seconds: float = 12.0
@@ -209,138 +211,84 @@ class TestStatus(BaseModel):
     errors: List[str]
     logs: List[Dict[str, str]]
     debug_errors: List[str] = []
+    llm_turns: List[Dict] = []
+    learning_memory: List[str] = []
     report_path: Optional[str] = None
+    current_objective: Optional[str] = None
+
+
+class DirectiveUpdate(BaseModel):
+    """Live directive update payload."""
+
+    instruction: str
+
+
+def _directive_to_objectives(instruction: str) -> Dict[str, Any]:
+    """Convert free text directive into internal objectives structure."""
+    from webqa_plus.utils.objectives import directive_to_objectives
+
+    return directive_to_objectives(instruction)
+
+
+def _apply_runtime_directive_to_engine(engine: Any, instruction: str) -> None:
+    """Apply objective updates to running engine and its agents."""
+    objectives = _directive_to_objectives(instruction)
+    engine.config.objectives = objectives
+    for agent in [engine.explorer, engine.tester, engine.validator, engine.reporter]:
+        if hasattr(agent, "config") and isinstance(agent.config, dict):
+            agent.config["objectives"] = objectives
 
 
 PROVIDERS = [
     ProviderInfo(
-        id="openai",
-        name="OpenAI",
-        icon="🤖",
-        description="GPT-4 Turbo, GPT-4, GPT-3.5",
-        default_model="gpt-4-turbo-preview",
-        env_var="OPENAI_API_KEY",
-    ),
-    ProviderInfo(
-        id="anthropic",
-        name="Anthropic",
-        icon="🧠",
-        description="Claude 3 Opus, Sonnet, Haiku",
-        default_model="claude-3-opus-20240229",
-        env_var="ANTHROPIC_API_KEY",
-    ),
-    ProviderInfo(
-        id="openrouter",
-        name="OpenRouter",
-        icon="🌐",
-        description="Access multiple models via OpenRouter",
-        default_model="anthropic/claude-3-opus",
-        env_var="OPENROUTER_API_KEY",
+        id="gemini",
+        name="Google Gemini",
+        icon="✨",
+        description="Gemini 2.0 Flash, Gemini 2.5 Pro, and more",
+        default_model="gemini-2.0-flash",
+        env_var="GOOGLE_API_KEY",
     ),
 ]
 
 
 STATIC_MODELS: Dict[str, List[Dict[str, str]]] = {
-    "openai": [
-        {"id": "gpt-4-turbo-preview", "name": "GPT-4 Turbo"},
-        {"id": "gpt-4", "name": "GPT-4"},
-        {"id": "gpt-4-32k", "name": "GPT-4 (32K)"},
-        {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo"},
-    ],
-    "anthropic": [
-        {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
-        {"id": "claude-3-sonnet-20240229", "name": "Claude 3 Sonnet"},
-        {"id": "claude-3-haiku-20240307", "name": "Claude 3 Haiku"},
-    ],
-    "openrouter": [
-        {"id": "anthropic/claude-3-opus", "name": "Claude 3 Opus"},
-        {"id": "anthropic/claude-3-sonnet", "name": "Claude 3 Sonnet"},
-        {"id": "openai/gpt-4-turbo", "name": "GPT-4 Turbo"},
-        {"id": "openai/gpt-4", "name": "GPT-4"},
-        {"id": "google/gemini-pro", "name": "Gemini Pro"},
+    "gemini": [
+        {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash"},
+        {"id": "gemini-2.0-flash-lite", "name": "Gemini 2.0 Flash Lite"},
+        {"id": "gemini-2.5-pro-preview-03-25", "name": "Gemini 2.5 Pro Preview"},
+        {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro"},
+        {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash"},
     ],
 }
 
 
 def _provider_env_var(provider: str) -> str:
-    env_map = {
-        "openai": "OPENAI_API_KEY",
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openrouter": "OPENROUTER_API_KEY",
-    }
-    return env_map.get(provider, "")
+    return "GOOGLE_API_KEY"
 
 
 def _resolve_api_key(provider: str, api_key: Optional[str]) -> str:
     if api_key and api_key.strip():
         return api_key.strip()
-    env_var = _provider_env_var(provider)
-    return os.getenv(env_var, "")
+    return os.getenv("GOOGLE_API_KEY", "")
 
 
-async def _fetch_openai_models(api_key: str) -> List[Dict[str, str]]:
+async def _fetch_gemini_models(api_key: str) -> List[Dict[str, str]]:
+    """Fetch available Gemini models from the Google AI API."""
     if not api_key:
-        raise ValueError("OpenAI API key is required for dynamic model fetch")
+        raise ValueError("Google API key is required")
 
     async with httpx.AsyncClient(timeout=12.0) as client:
         response = await client.get(
-            "https://api.openai.com/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
         )
         response.raise_for_status()
         payload = response.json()
 
     models = []
-    for model in payload.get("data", []):
-        model_id = model.get("id")
-        if not model_id:
-            continue
-        models.append({"id": model_id, "name": model_id})
-
-    return sorted(models, key=lambda m: m["id"])
-
-
-async def _fetch_anthropic_models(api_key: str) -> List[Dict[str, str]]:
-    if not api_key:
-        raise ValueError("Anthropic API key is required for dynamic model fetch")
-
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(
-            "https://api.anthropic.com/v1/models",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-    models = []
-    for model in payload.get("data", []):
-        model_id = model.get("id")
-        display_name = model.get("display_name") or model_id
-        if not model_id:
-            continue
-        models.append({"id": model_id, "name": display_name})
-
-    return sorted(models, key=lambda m: m["id"])
-
-
-async def _fetch_openrouter_models(api_key: str) -> List[Dict[str, str]]:
-    headers: Dict[str, str] = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get("https://openrouter.ai/api/v1/models", headers=headers)
-        response.raise_for_status()
-        payload = response.json()
-
-    models = []
-    for model in payload.get("data", []):
-        model_id = model.get("id")
-        display_name = model.get("name") or model_id
-        if not model_id:
+    for model in payload.get("models", []):
+        model_id = model.get("name", "").replace("models/", "")
+        display_name = model.get("displayName") or model_id
+        if not model_id or "gemini" not in model_id:
             continue
         models.append({"id": model_id, "name": display_name})
 
@@ -348,13 +296,7 @@ async def _fetch_openrouter_models(api_key: str) -> List[Dict[str, str]]:
 
 
 async def _fetch_provider_models(provider: str, api_key: str) -> List[Dict[str, str]]:
-    if provider == "openai":
-        return await _fetch_openai_models(api_key)
-    if provider == "anthropic":
-        return await _fetch_anthropic_models(api_key)
-    if provider == "openrouter":
-        return await _fetch_openrouter_models(api_key)
-    return []
+    return await _fetch_gemini_models(api_key)
 
 
 def get_static_dir() -> Path:
@@ -472,7 +414,10 @@ def create_app() -> FastAPI:
             "errors": [],
             "debug_errors": [],
             "logs": [],
+            "llm_turns": [],
+            "learning_memory": [],
             "report_path": None,
+            "current_objective": (config.test_instruction or "").strip() or None,
             "start_time": datetime.now().isoformat(),
             "end_time": None,
         }
@@ -501,7 +446,10 @@ def create_app() -> FastAPI:
             errors=session["errors"],
             logs=session["logs"],
             debug_errors=session.get("debug_errors", []),
+            llm_turns=session.get("llm_turns", []),
+            learning_memory=session.get("learning_memory", []),
             report_path=session.get("report_path"),
+            current_objective=session.get("current_objective"),
         )
 
     @app.post("/api/test/{session_id}/stop")
@@ -513,6 +461,24 @@ def create_app() -> FastAPI:
         test_sessions[session_id]["status"] = "stopped"
         _append_log(test_sessions[session_id], "warning", "Stop requested by user")
         return {"status": "stopped"}
+
+    @app.post("/api/test/{session_id}/directive")
+    async def update_directive(session_id: str, payload: DirectiveUpdate):
+        """Update runtime directive/objective while a session is running."""
+        session = test_sessions.get(session_id)
+        if not session:
+            return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+        instruction = (payload.instruction or "").strip()
+        if not instruction:
+            return JSONResponse(status_code=400, content={"error": "Instruction is required"})
+
+        session["current_objective"] = instruction
+        engine = session.get("engine")
+        if engine is not None:
+            _apply_runtime_directive_to_engine(engine, instruction)
+        _append_log(session, "info", f"Runtime directive updated: {instruction[:200]}")
+        return {"status": "ok", "current_objective": instruction}
 
     @app.get("/api/reports")
     async def list_reports():
@@ -574,7 +540,10 @@ def create_app() -> FastAPI:
 
         try:
             while True:
-                session = test_sessions[session_id]
+                session = test_sessions.get(session_id)
+                if session is None:
+                    await websocket.close(code=4004)
+                    break
                 await websocket.send_json(
                     {
                         "status": session["status"],
@@ -584,12 +553,23 @@ def create_app() -> FastAPI:
                         "urls_visited": session["urls_visited"],
                         "flows_discovered": session["flows_discovered"],
                         "test_results": session["test_results"],
+                        "current_objective": session.get("current_objective"),
+                        "llm_turns": session.get("llm_turns", [])[-30:],
                         "logs": session["logs"][-50:],
+                        "errors": session.get("errors", []),
+                        "debug_errors": session.get("debug_errors", []),
+                        "learning_memory": session.get("learning_memory", [])[-15:],
                     }
                 )
                 await asyncio.sleep(1)
         except WebSocketDisconnect:
             pass
+        except Exception:
+            # Connection lost or serialization error — don't crash
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
@@ -632,9 +612,9 @@ async def run_test_session(session_id: str):
         # Build configuration
         app_config = AppConfig()
 
-        # LLM configuration
-        app_config.llm.provider = config_data["provider"]
-        app_config.llm.api_key = config_data["api_key"]
+        # Gemini LLM configuration
+        app_config.llm.provider = "gemini"
+        app_config.llm.api_key = config_data["api_key"] or os.getenv("GOOGLE_API_KEY", "")
         app_config.llm.model = config_data["model"]
         app_config.llm.max_tokens = config_data["max_tokens"]
         app_config.llm.temperature = config_data["temperature"]
@@ -646,6 +626,7 @@ async def run_test_session(session_id: str):
         app_config.testing.output_dir = config_data["output_dir"]
         app_config.testing.screenshot_on_error = config_data["screenshot_on_error"]
         app_config.testing.screenshot_on_action = config_data["screenshot_on_action"]
+        app_config.testing.dom_exploration_enabled = config_data.get("dom_exploration_enabled", True)
         app_config.testing.hidden_menu_expander = config_data.get("hidden_menu_expander", True)
         app_config.testing.deep_traversal = config_data.get("deep_traversal", True)
         app_config.testing.path_discovery_boost = int(config_data.get("path_discovery_boost", 1))
@@ -653,9 +634,9 @@ async def run_test_session(session_id: str):
         app_config.testing.email_verification_enabled = config_data.get(
             "email_verification_enabled", False
         )
-        app_config.testing.email_provider = config_data.get("email_provider", "1secmail")
+        app_config.testing.email_provider = config_data.get("email_provider", "guerrillamail")
         app_config.testing.email_provider_base_url = config_data.get(
-            "email_provider_base_url", "https://www.1secmail.com/api/v1/"
+            "email_provider_base_url", "https://api.guerrillamail.com/ajax.php"
         )
         app_config.testing.email_poll_timeout_seconds = int(
             config_data.get("email_poll_timeout_seconds", 120)
@@ -667,15 +648,44 @@ async def run_test_session(session_id: str):
             config_data.get("email_request_timeout_seconds", 12.0)
         )
 
+        # Runtime objective direction from UI instruction
+        instruction = str(config_data.get("test_instruction") or "").strip()
+        if instruction:
+            app_config.objectives = _directive_to_objectives(instruction)
+            session["current_objective"] = instruction
+            _append_log(session, "info", f"Objective directive: {instruction[:160]}")
+
+        signup_intent = instruction.lower()
+        has_auth_credentials = bool(
+            config_data.get("auth_enabled")
+            and config_data.get("auth_email")
+            and config_data.get("auth_password")
+        )
+        disable_forced_auth = (
+            not has_auth_credentials
+            and any(
+                token in signup_intent
+                for token in ["sign up", "signup", "register", "create account"]
+            )
+        )
+
         # Playwright configuration
         app_config.playwright.browser = config_data["browser"]
         app_config.playwright.headless = config_data["headless"]
 
         # Auth configuration
         if config_data["auth_enabled"]:
-            app_config.auth.enabled = True
-            app_config.auth.email = config_data.get("auth_email")
-            app_config.auth.password = config_data.get("auth_password")
+            if disable_forced_auth:
+                app_config.auth.enabled = False
+                _append_log(
+                    session,
+                    "info",
+                    "Auth auto-login disabled because objective targets signup/register flow.",
+                )
+            else:
+                app_config.auth.enabled = True
+                app_config.auth.email = config_data.get("auth_email")
+                app_config.auth.password = config_data.get("auth_password")
 
         # Ensure output directory exists
         output_dir = Path(config_data["output_dir"])
@@ -683,6 +693,7 @@ async def run_test_session(session_id: str):
 
         # Create and run engine
         engine = TestEngine(app_config, console, verbose=False)
+        session["engine"] = engine
 
         async def handle_state_update(state: Dict[str, Any]) -> None:
             if session.get("status") == "stopped":
@@ -698,6 +709,12 @@ async def run_test_session(session_id: str):
             session["urls_visited"] = len(state.get("visited_urls", []))
             session["flows_discovered"] = len(state.get("discovered_flows", []))
             session["test_results"] = len(state.get("test_results", []))
+            incoming_turns = list(state.get("llm_turns") or [])
+            if incoming_turns:
+                session["llm_turns"] = incoming_turns[-100:]
+            incoming_learnings = list(state.get("learning_memory") or [])
+            if incoming_learnings:
+                session["learning_memory"] = incoming_learnings[-30:]
 
             current_state = str(state.get("current_state", "running"))
             _append_log(
@@ -737,6 +754,7 @@ async def run_test_session(session_id: str):
             _append_log(session, "success", f"Test completed. Report: {report_path.name}")
         else:
             _append_log(session, "success", "Test completed.")
+        session.pop("engine", None)
 
     except Exception as e:
         session["status"] = "failed"
@@ -744,11 +762,25 @@ async def run_test_session(session_id: str):
         session["end_time"] = datetime.now().isoformat()
         _append_log(session, "error", _friendly_error_message(e))
         _log_exception_details(session, e, "test-run")
+        session.pop("engine", None)
 
 
-def start_server(host: str = "127.0.0.1", port: int = 8095):
-    """Start the web server."""
+def start_server(host: str = "127.0.0.1", port: int = 8095, reload: bool = False):
+    """Start the web server. Respects PORT env var for Cloud Run compatibility."""
     import uvicorn
+    import os as _os
+
+    port = int(_os.getenv("PORT", port))
+    host = _os.getenv("HOST", host)
+    if reload:
+        uvicorn.run(
+            "webqa_plus.web.server:create_app",
+            host=host,
+            port=port,
+            reload=True,
+            factory=True,
+        )
+        return
 
     app = create_app()
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, reload=False)

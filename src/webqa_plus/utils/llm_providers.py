@@ -1,146 +1,81 @@
-"""LLM provider factory and configuration for multi-provider support."""
+"""Gemini LLM provider factory and configuration."""
 
 import os
-from enum import Enum
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI
-
-try:
-    from langchain_anthropic import ChatAnthropic
-except ImportError:
-    ChatAnthropic = None
-
-try:
-    from langchain_community.chat_models import ChatOpenRouter
-except ImportError:
-    ChatOpenRouter = None
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 
-class LLMProvider(str, Enum):
-    """Supported LLM providers."""
-
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
-    OPENROUTER = "openrouter"
+DEFAULT_MODEL = "gemini-2.0-flash"
+PROVIDER = "gemini"
 
 
 class LLMConfig:
-    """Configuration for an LLM provider."""
+    """Configuration for the Gemini LLM provider."""
 
     def __init__(
         self,
-        provider: Union[str, LLMProvider] = LLMProvider.OPENAI,
+        provider: str = PROVIDER,
         api_key: Optional[str] = None,
-        model: str = "gpt-4-turbo-preview",
+        model: str = DEFAULT_MODEL,
         max_tokens: int = 4096,
         temperature: float = 0.3,
         base_url: Optional[str] = None,
+        multimodal: bool = True,
+        vertex_ai: bool = False,
         **kwargs: Any,
     ):
-        """Initialize LLM configuration.
+        """Initialize Gemini LLM configuration.
 
         Args:
-            provider: The LLM provider to use
-            api_key: API key for the provider
-            model: Model name to use
+            provider: Must be "gemini" (only supported provider)
+            api_key: Google AI API key (or Vertex AI key)
+            model: Gemini model name
             max_tokens: Maximum tokens to generate
             temperature: Temperature for generation
-            base_url: Optional base URL for API
+            base_url: Optional custom API endpoint
+            multimodal: Enable screenshot injection for vision-based QA
+            vertex_ai: Use Vertex AI endpoint instead of AI Studio
             **kwargs: Additional provider-specific options
         """
-        self.provider = LLMProvider(provider)
-        self.api_key = api_key or self._get_api_key_from_env()
+        if provider != PROVIDER:
+            raise ValueError(
+                f"Only 'gemini' provider is supported. Got: {provider}"
+            )
+        self.provider = PROVIDER
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.base_url = base_url
+        self.multimodal = multimodal
+        self.vertex_ai = vertex_ai
         self.extra_kwargs = kwargs
 
-    def _get_api_key_from_env(self) -> str:
-        """Get API key from environment variables based on provider."""
-        env_vars = {
-            LLMProvider.OPENAI: "OPENAI_API_KEY",
-            LLMProvider.ANTHROPIC: "ANTHROPIC_API_KEY",
-            LLMProvider.OPENROUTER: "OPENROUTER_API_KEY",
-        }
-        env_var = env_vars.get(self.provider)
-        return os.getenv(env_var, "") if env_var else ""
-
     def create_llm(self) -> BaseChatModel:
-        """Create and return the appropriate LLM instance."""
-        if self.provider == LLMProvider.OPENAI:
-            return self._create_openai_llm()
-        elif self.provider == LLMProvider.ANTHROPIC:
-            return self._create_anthropic_llm()
-        elif self.provider == LLMProvider.OPENROUTER:
-            return self._create_openrouter_llm()
-        else:
-            raise ValueError(f"Unknown provider: {self.provider}")
-
-    def _create_openai_llm(self) -> ChatOpenAI:
-        """Create OpenAI LLM instance."""
+        """Create and return a ChatGoogleGenerativeAI instance."""
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_output_tokens": self.max_tokens,
         }
         if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.base_url:
-            kwargs["base_url"] = self.base_url
+            kwargs["google_api_key"] = self.api_key
         kwargs.update(self.extra_kwargs)
-        return ChatOpenAI(**kwargs)
-
-    def _create_anthropic_llm(self) -> ChatAnthropic:
-        """Create Anthropic (Claude) LLM instance."""
-        if ChatAnthropic is None:
-            raise ImportError(
-                "langchain-anthropic is required for Anthropic provider. "
-                "Install with: uv add langchain-anthropic"
-            )
-
-        kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        if self.base_url:
-            kwargs["anthropic_api_url"] = self.base_url
-        kwargs.update(self.extra_kwargs)
-        return ChatAnthropic(**kwargs)
-
-    def _create_openrouter_llm(self) -> ChatOpenAI:
-        """Create OpenRouter LLM instance (uses OpenAI-compatible API)."""
-        kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "base_url": self.base_url or "https://openrouter.ai/api/v1",
-        }
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-
-        # Add OpenRouter-specific headers
-        kwargs["default_headers"] = {
-            "HTTP-Referer": "https://github.com/yourusername/webqa-plus",
-            "X-Title": "WebQA-Plus",
-        }
-        kwargs.update(self.extra_kwargs)
-        return ChatOpenAI(**kwargs)
+        return ChatGoogleGenerativeAI(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
         return {
-            "provider": self.provider.value,
+            "provider": self.provider,
             "api_key": self.api_key,
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "base_url": self.base_url,
+            "multimodal": self.multimodal,
+            "vertex_ai": self.vertex_ai,
             **self.extra_kwargs,
         }
 
@@ -150,25 +85,19 @@ class LLMConfig:
         return cls(**config_dict)
 
 
-def get_default_model_for_provider(provider: Union[str, LLMProvider]) -> str:
-    """Get the default model for a provider.
+# Legacy alias kept so imports don't break
+class LLMProvider:
+    """Stub kept for backward-compat imports."""
+    GEMINI = "gemini"
 
-    Args:
-        provider: The LLM provider
 
-    Returns:
-        Default model name for the provider
-    """
-    defaults = {
-        LLMProvider.OPENAI: "gpt-4-turbo-preview",
-        LLMProvider.ANTHROPIC: "claude-3-opus-20240229",
-        LLMProvider.OPENROUTER: "anthropic/claude-3-opus",
-    }
-    return defaults.get(LLMProvider(provider), "gpt-4-turbo-preview")
+def get_default_model_for_provider(provider: str = PROVIDER) -> str:
+    """Return the default Gemini model name."""
+    return DEFAULT_MODEL
 
 
 def validate_provider_config(config: Dict[str, Any]) -> Dict[str, str]:
-    """Validate provider configuration and return errors.
+    """Validate Gemini provider configuration.
 
     Args:
         config: Configuration dictionary
@@ -178,21 +107,11 @@ def validate_provider_config(config: Dict[str, Any]) -> Dict[str, str]:
     """
     errors: Dict[str, str] = {}
 
-    provider = config.get("provider", "openai")
-    try:
-        LLMProvider(provider)
-    except ValueError:
-        errors["provider"] = f"Invalid provider: {provider}"
+    provider = config.get("provider", PROVIDER)
+    if provider != PROVIDER:
+        errors["provider"] = f"Only 'gemini' is supported. Got: {provider}"
 
-    if not config.get("api_key"):
-        # Check environment variable
-        env_vars = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openrouter": "OPENROUTER_API_KEY",
-        }
-        env_var = env_vars.get(provider)
-        if env_var and not os.getenv(env_var):
-            errors["api_key"] = f"API key required. Set {env_var} environment variable."
+    if not config.get("api_key") and not os.getenv("GOOGLE_API_KEY"):
+        errors["api_key"] = "API key required. Set GOOGLE_API_KEY environment variable."
 
     return errors

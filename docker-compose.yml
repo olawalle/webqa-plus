@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  webqa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: webqa-plus:latest
+    container_name: webqa-plus
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app/src
+      - PLAYWRIGHT_BROWSERS_PATH=/usr/bin/chromium
+      - PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+    volumes:
+      # Persist generated reports outside the container
+      - ./reports:/app/reports
+    ports:
+      # Only expose to localhost; Nginx will proxy from the outside
+      - "127.0.0.1:8080:8080"
+    # Playwright needs /dev/shm for Chromium sandbox
+    shm_size: "256m"
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_ADMIN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/providers"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: webqa-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # SSL certificates managed by Certbot
+      - ./nginx/certs:/etc/letsencrypt:ro
+      - ./nginx/www:/var/www/certbot:ro
+    depends_on:
+      - webqa
+
+  # Certbot container for automatic SSL renewal
+  certbot:
+    image: certbot/certbot:latest
+    container_name: webqa-certbot
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/www:/var/www/certbot
+    # Run manually the first time; renewal handled via cron
+    entrypoint: /bin/sh -c "trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done"

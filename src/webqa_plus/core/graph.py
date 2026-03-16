@@ -75,6 +75,7 @@ class GraphState(TypedDict):
     llm_calls: int
     total_tokens: int
     estimated_cost: float
+    llm_turns: List[Dict[str, Any]]
 
     # Configuration
     config: Dict[str, Any]
@@ -84,6 +85,9 @@ class GraphState(TypedDict):
     # Error handling
     errors: List[str]
     should_stop: bool
+
+    # Self-learning memory — accumulated insights from prior agent turns
+    learning_memory: List[str]
 
 
 class LangGraphOrchestrator:

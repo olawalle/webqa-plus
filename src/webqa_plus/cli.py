@@ -38,6 +38,11 @@ def _project_root() -> Path:
 def web(
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host to bind the web server"),
     port: int = typer.Option(8095, "--port", "-p", help="Port to run the web server"),
+    reload: bool = typer.Option(
+        True,
+        "--reload/--no-reload",
+        help="Auto-reload backend on code changes (recommended for development)",
+    ),
 ):
     """Launch the WebQA-Plus web interface.
 
@@ -55,7 +60,7 @@ def web(
     try:
         from webqa_plus.web.server import start_server
 
-        start_server(host=host, port=port)
+        start_server(host=host, port=port, reload=reload)
     except ImportError as e:
         console.print(f"[red]Error: Web interface dependencies not installed. {e}[/red]")
         console.print("[dim]Install with: uv sync[/dim]")
@@ -109,7 +114,7 @@ def suite(
         "-c",
         (
             "from webqa_plus.web.server import start_server; "
-            f"start_server(host='{host}', port={backend_port})"
+            f"start_server(host='{host}', port={backend_port}, reload=True)"
         ),
     ]
     frontend_cmd = ["npm", "run", "dev", "--", "--host", host, "--port", str(frontend_port)]
@@ -159,6 +164,9 @@ def test(
     url: str = typer.Option(..., "--url", "-u", help="Target URL to test"),
     email: Optional[str] = typer.Option(None, "--email", "-e", help="Login email"),
     password: Optional[str] = typer.Option(None, "--password", "-p", help="Login password"),
+    instruction: Optional[str] = typer.Option(
+        None, "--instruction", help="Natural language test directive (dynamic)"
+    ),
     mode: str = typer.Option("stealth", "--mode", "-m", help="Runtime mode: visual or stealth"),
     max_steps: int = typer.Option(200, "--max-steps", "-s", help="Maximum exploration steps"),
     output_dir: Path = typer.Option(
@@ -166,6 +174,9 @@ def test(
     ),
     config: Optional[Path] = typer.Option(None, "--config", "-c", help="Configuration file path"),
     objectives: Optional[Path] = typer.Option(None, "--objectives", help="Custom objectives file"),
+    force_objectives: bool = typer.Option(
+        False, "--force-objectives", help="Allow static objectives file usage"
+    ),
     headless_override: Optional[bool] = typer.Option(
         None, "--headless/--no-headless", help="Override headless mode"
     ),
@@ -216,11 +227,13 @@ def test(
                 url=url,
                 email=email,
                 password=password,
+                instruction=instruction,
                 mode=mode,
                 max_steps=max_steps,
                 output_dir=output_dir,
                 config_path=config,
                 objectives_path=objectives,
+                force_objectives=force_objectives,
                 headless_override=headless_override,
                 verbose=verbose,
             )
@@ -239,11 +252,13 @@ async def _run_test(
     url: str,
     email: Optional[str],
     password: Optional[str],
+    instruction: Optional[str],
     mode: str,
     max_steps: int,
     output_dir: Path,
     config_path: Optional[Path],
     objectives_path: Optional[Path],
+    force_objectives: bool,
     headless_override: Optional[bool],
     verbose: bool,
 ):
@@ -270,11 +285,21 @@ async def _run_test(
     else:
         config.playwright.headless = mode == "stealth"
 
-    # Load custom objectives if provided
-    if objectives_path:
-        from webqa_plus.utils.objectives import load_objectives
+    # Load instruction directive or custom objectives
+    if instruction:
+        from webqa_plus.utils.objectives import directive_to_objectives
 
-        config.objectives = load_objectives(objectives_path)
+        config.objectives = directive_to_objectives(instruction)
+    elif objectives_path:
+        if not force_objectives:
+            console.print(
+                "[yellow]Static objectives are disabled by default. "
+                "Use --force-objectives to enable them, or pass --instruction for dynamic flows.[/yellow]"
+            )
+        else:
+            from webqa_plus.utils.objectives import load_objectives
+
+            config.objectives = load_objectives(objectives_path)
 
     # Initialize and run test engine
     with Progress(
@@ -311,12 +336,8 @@ def doctor():
 
     # Check LLM providers
     llm_providers = []
-    if os.getenv("OPENAI_API_KEY"):
-        llm_providers.append("OpenAI")
-    if os.getenv("ANTHROPIC_API_KEY"):
-        llm_providers.append("Anthropic")
-    if os.getenv("OPENROUTER_API_KEY"):
-        llm_providers.append("OpenRouter")
+    if os.getenv("GOOGLE_API_KEY"):
+        llm_providers.append("Google Gemini")
 
     checks = [
         ("Python 3.12+", f"{sys.version_info.major}.{sys.version_info.minor}"),
@@ -340,10 +361,8 @@ def doctor():
         console.print("[green]All checks passed! Ready to test.[/green]")
     else:
         console.print("[yellow]Some checks failed. Run --help for setup instructions.[/yellow]")
-        console.print("\n[dim]To configure LLM providers, set one of:[/dim]")
-        console.print("  - OPENAI_API_KEY for OpenAI")
-        console.print("  - ANTHROPIC_API_KEY for Anthropic (Claude)")
-        console.print("  - OPENROUTER_API_KEY for OpenRouter")
+        console.print("\n[dim]To configure Gemini, set:[/dim]")
+        console.print("  - GOOGLE_API_KEY  (get yours at https://aistudio.google.com/apikey)")
 
 
 def _check_playwright():
@@ -362,6 +381,9 @@ def _check_playwright():
 def _check_weasyprint():
     """Check if WeasyPrint dependencies are available."""
     try:
+        from webqa_plus.utils.weasyprint_env import configure_weasyprint_env
+
+        configure_weasyprint_env()
         import weasyprint
 
         return True

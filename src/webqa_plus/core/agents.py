@@ -1,17 +1,37 @@
 """Agent implementations for the LangGraph orchestrator."""
 
+import base64
 import json
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from PIL import Image, ImageDraw
 
 from webqa_plus.core.graph import AgentState, GraphState, TestStep, UserFlow
 from webqa_plus.utils.email_service import DynamicEmailService, InboxDetails, generate_fallback_identity
 from webqa_plus.utils.llm_providers import LLMConfig
+
+
+def _parse_llm_json(text: str) -> Any:
+    """Parse JSON from an LLM response, tolerating markdown code-fence wrappers."""
+    stripped = text.strip()
+    # Strip ``` or ```json ... ``` wrappers that Gemini commonly returns
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        # Drop first line (```json / ```) and trailing ``` line if present
+        end = len(lines) - 1 if lines[-1].strip() == "```" else len(lines)
+        stripped = "\n".join(lines[1:end]).strip()
+    result = json.loads(stripped)
+    # If the LLM returns a JSON array instead of an object, unwrap the first element
+    if isinstance(result, list):
+        return result[0] if result else {}
+    return result
 
 
 class BaseAgent(ABC):
@@ -49,10 +69,92 @@ class BaseAgent(ABC):
         cost_per_1k = self.config.get("cost", {}).get("estimated_cost_per_1k_tokens", 0.01)
         state["estimated_cost"] = (state["total_tokens"] / 1000) * cost_per_1k
 
+    def _record_llm_turn(self, state: GraphState, agent: str, prompt: str, response_text: str) -> None:
+        """Record one LLM conversation turn for real-time UI display."""
+        turns = state.get("llm_turns")
+        if turns is None:
+            return
+        turns.append({
+            "ts": datetime.now().isoformat(),
+            "agent": agent,
+            "prompt": str(prompt)[:2000],
+            "response": str(response_text)[:2000],
+        })
+        if len(turns) > 100:
+            state["llm_turns"] = turns[-100:]
+
     def _has_llm_configured(self) -> bool:
         """Check if LLM is configured with valid credentials."""
         llm_config = self.config.get("llm", {})
         return bool(llm_config.get("api_key")) and self.llm_enabled and self.llm is not None
+
+    def _record_learning(self, state: GraphState, insight: str) -> None:
+        """Add a short insight to the learning memory."""
+        mem = state.get("learning_memory")
+        if mem is None:
+            return
+        mem.append(insight)
+        if len(mem) > 30:
+            state["learning_memory"] = mem[-30:]
+
+    def _build_learning_context(self, state: GraphState) -> str:
+        """Build a compact summary of recent agent observations and outcomes.
+
+        Injected into LLM prompts so each agent call is informed by what
+        previous steps discovered, attempted, and whether they succeeded or failed.
+        """
+        sections: List[str] = []
+
+        # 1. Persistent learnings captured across steps
+        memories = state.get("learning_memory", [])
+        if memories:
+            sections.append(
+                "AGENT MEMORY (insights from previous steps):\n"
+                + "\n".join(f"  - {m}" for m in memories[-8:])
+            )
+
+        # 2. Recent LLM turns — last 3 responses from any agent
+        turns = state.get("llm_turns", [])
+        if turns:
+            recent = turns[-3:]
+            turn_lines = []
+            for t in recent:
+                agent = t.get("agent", "?")
+                resp = t.get("response", "")[:250]
+                turn_lines.append(f"  [{agent}]: {resp}")
+            sections.append(
+                "RECENT AGENT RESPONSES (use these to avoid repeating mistakes):\n"
+                + "\n".join(turn_lines)
+            )
+
+        # 3. Recent action outcomes from test_results
+        results = state.get("test_results", [])
+        if results:
+            recent_results = results[-5:]
+            outcome_lines = []
+            for r in recent_results:
+                status = getattr(r, "status", "unknown")
+                action = getattr(r, "action", "?")[:80]
+                err = getattr(r, "error_message", "") or ""
+                line = f"  {status}: {action}"
+                if err:
+                    line += f" — {err[:80]}"
+                outcome_lines.append(line)
+            sections.append(
+                "RECENT ACTION OUTCOMES:\n" + "\n".join(outcome_lines)
+            )
+
+        # 4. Accumulated errors
+        errors = state.get("errors", [])
+        if errors:
+            sections.append(
+                "KNOWN ERRORS:\n"
+                + "\n".join(f"  - {e[:120]}" for e in errors[-3:])
+            )
+
+        if not sections:
+            return ""
+        return "\n\n" + "\n\n".join(sections) + "\n"
 
     def _is_llm_auth_error(self, error: Exception) -> bool:
         """Check whether an LLM error indicates auth/credential issues."""
@@ -74,17 +176,158 @@ class BaseAgent(ABC):
             self.llm_enabled = False
             state["errors"].append(reason)
 
+    def _objective_items(self) -> List[Dict[str, Any]]:
+        """Return configured objective items in a uniform shape."""
+        objective_config = self.config.get("objectives") or {}
+        objective_items = objective_config.get("objectives") if isinstance(objective_config, dict) else None
+        return [item for item in (objective_items or []) if isinstance(item, dict)]
+
+    def _primary_objective(self) -> Optional[Dict[str, Any]]:
+        """Return the highest-priority active objective, if any."""
+        items = self._objective_items()
+        return items[0] if items else None
+
+    def _primary_objective_text(self) -> str:
+        """Return the primary objective description for focused runs."""
+        item = self._primary_objective()
+        if not item:
+            return ""
+        return str(item.get("description") or item.get("name") or "").strip()
+
+    def _auth_credentials_available(self) -> bool:
+        """Return True when explicit auth credentials are configured."""
+        auth_cfg = self.config.get("auth", {}) if isinstance(self.config, dict) else {}
+        return bool(auth_cfg.get("enabled") and auth_cfg.get("email") and auth_cfg.get("password"))
+
+    def _objective_is_strict(self) -> bool:
+        """Treat user-directed objectives as strict focus requests."""
+        item = self._primary_objective()
+        if not item:
+            return False
+        if self._auth_credentials_available():
+            objective_text = self._primary_objective_text().lower()
+            if any(token in objective_text for token in ["sign up", "signup", "register", "create account"]):
+                return False
+        if "strict" in item:
+            return bool(item.get("strict"))
+        return str(item.get("name", "")).strip().lower() == "user directed objective"
+
+    def _pick_signup_switch_action(self, actions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Prefer explicit signup CTA clicks when signup is required."""
+        signup_tokens = [
+            "sign up",
+            "signup",
+            "register",
+            "create account",
+            "get started",
+            "start free",
+            "join",
+            "new here",
+            "free trial",
+        ]
+
+        for action in actions:
+            if action.get("type") not in {"click", "select"}:
+                continue
+            blob = (
+                f"{action.get('text', '')} {action.get('description', '')} {action.get('selector', '')} "
+                f"{action.get('name', '')} {action.get('id', '')} {action.get('aria_label', '')} "
+                f"{action.get('title', '')} {action.get('href', '')}"
+            ).lower()
+            if any(token in blob for token in signup_tokens):
+                return {
+                    "action_type": action.get("type", "click"),
+                    "target": action.get("selector", action.get("description", "")),
+                    "value": self._action_semantic_key(action),
+                }
+
+        return None
+
+    def _objective_terms(self) -> set[str]:
+        """Extract lightweight keyword hints from configured objectives."""
+        keywords: set[str] = set()
+        for item in self._objective_items():
+            name = str(item.get("name", ""))
+            description = str(item.get("description", ""))
+            required_elements = item.get("required_elements") or []
+            critical_paths = item.get("critical_paths") or []
+
+            corpus_parts = [name, description]
+            corpus_parts.extend(str(value) for value in required_elements)
+            for path in critical_paths:
+                if isinstance(path, list):
+                    corpus_parts.extend(str(step) for step in path)
+
+            corpus = " ".join(corpus_parts).lower()
+            for token in re.findall(r"[a-z][a-z0-9_-]{2,}", corpus):
+                normalized = token.replace("_", "-")
+                if normalized in {
+                    "flow",
+                    "page",
+                    "user",
+                    "create",
+                    "manage",
+                    "test",
+                    "testing",
+                    "verify",
+                    "validate",
+                    "check",
+                    "ensure",
+                    "focus",
+                    "particular",
+                    "only",
+                }:
+                    continue
+                keywords.add(normalized)
+
+        return keywords
+
+    def _objective_matches_text(self, text: str) -> bool:
+        """Check whether text aligns with the configured objective."""
+        blob = str(text or "").lower()
+        keywords = self._objective_terms()
+        if not blob or not keywords:
+            return False
+        return any(keyword in blob for keyword in keywords)
+
+    def _objective_flow_name(self) -> Optional[str]:
+        """Build a concise flow name from the current objective."""
+        text = self._primary_objective_text()
+        if not text:
+            return None
+
+        normalized = re.sub(r"\s+", " ", text).strip()
+        normalized = re.sub(
+            r"^(please\s+)?(test|verify|validate|check|ensure|focus on|only|just)\s+",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;-")
+        if not normalized:
+            return None
+
+        words = normalized.split()
+        short_name = " ".join(words[:5])
+        if "flow" not in short_name.lower():
+            short_name = f"{short_name.title()} Flow"
+        return short_name
+
 
 class ExplorerAgent(BaseAgent):
     """Explorer agent - discovers flows using WebQA + MCP."""
 
-    SYSTEM_PROMPT = """You are an expert web QA explorer. Your job is to discover user flows and interactive elements on a web page.
+    SYSTEM_PROMPT = """You are an expert web QA explorer and visual analyst powered by Gemini. Your job is to discover user flows and interactive elements on a web page.
 
-Using the accessibility tree from MCP, identify:
+You will receive both the accessibility tree (structured data) AND a screenshot of the current page. Use both sources:
+- The screenshot gives you the visual layout, colours, and any content not captured in the accessibility tree
+- The accessibility tree gives you precise element roles, labels, and hierarchy
+
+Using both inputs, identify:
 1. Interactive elements (buttons, links, forms, inputs)
 2. Navigation paths and user flows
 3. Critical user journeys to test
 4. Dead ends and error states
+5. Any visual anomalies (broken images, overlapping elements, layout issues)
 
 For each element, provide:
 - element_type: button, link, input, etc.
@@ -98,17 +341,27 @@ Respond in JSON format with a list of discoverable actions."""
         """Explore the current page and discover actions."""
         page = state["browser"]
         mcp_client = state["mcp_client"]
+        testing_cfg = self.config.get("testing", {})
+        dom_exploration_enabled = bool(testing_cfg.get("dom_exploration_enabled", True))
 
         # Get accessibility tree from MCP
-        try:
-            accessibility_tree = await mcp_client.get_accessibility_tree(page)
-        except Exception as e:
-            state["errors"].append(f"MCP accessibility tree failed: {e}")
-            accessibility_tree = {"elements": []}
+        if dom_exploration_enabled:
+            try:
+                accessibility_tree = await mcp_client.get_accessibility_tree(page)
+            except Exception as e:
+                state["errors"].append(f"MCP accessibility tree failed: {e}")
+                accessibility_tree = {"elements": []}
+        else:
+            accessibility_tree = {
+                "elements": [],
+                "dom_exploration_enabled": False,
+                "note": "DOM exploration disabled; use visual inference from screenshots.",
+            }
 
         # Get page info
         current_url = page.url
         page_title = await page.title()
+        objective_text = self._primary_objective_text()
 
         # Update state
         state["current_url"] = current_url
@@ -116,35 +369,105 @@ Respond in JSON format with a list of discoverable actions."""
 
         artifacts = state.setdefault("artifacts", {})
         known_flows = artifacts.setdefault("known_flow_names", set())
-        available_actions = await mcp_client.get_available_actions(page)
+        try:
+            available_actions = await mcp_client.get_available_actions(page)
+        except Exception:
+            available_actions = []
 
-        # Use LLM to plan exploration
+        if objective_text:
+            objective_flow_name = self._objective_flow_name() or "Focused Objective Flow"
+            objective_flow = None
+            for flow in state["discovered_flows"]:
+                flow_blob = f"{getattr(flow, 'name', '')} {getattr(flow, 'description', '')}"
+                if self._objective_matches_text(flow_blob) or getattr(flow, "name", "") == objective_flow_name:
+                    objective_flow = flow
+                    break
+
+            if objective_flow is None:
+                objective_flow = UserFlow(
+                    flow_id=f"objective_{state['current_step']}",
+                    name=objective_flow_name,
+                    description=objective_text,
+                    start_url=current_url,
+                    status="testing",
+                )
+                state["discovered_flows"].insert(0, objective_flow)
+                known_flows.add(objective_flow.name.lower())
+
+            state["current_flow"] = objective_flow
+
+        # Use LLM to plan exploration (multimodal: accessibility tree + screenshot)
         if self._has_llm_configured():
+            # Capture screenshot for multimodal vision input
+            screenshot_b64: Optional[str] = None
+            try:
+                screenshot_bytes = await page.screenshot(type="png", full_page=False)
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+            except Exception:
+                pass  # Vision is additive; continue without it if screenshot fails
+
+            # Build multimodal human message content
+            learning_ctx = self._build_learning_context(state)
+            text_content = (
+                f"Page: {page_title}\n"
+                f"URL: {current_url}\n\n"
+                + (
+                    f"Primary objective: {objective_text}\n"
+                    "Prioritize actions and flows that directly support this objective. "
+                    "If unrelated dialogs or share modals block the target flow, identify dismiss/close actions first.\n\n"
+                    if objective_text
+                    else ""
+                )
+                + (
+                    "DOM exploration is disabled for this run. "
+                    "Infer navigation and functionality primarily from the screenshot and visible UI cues.\n\n"
+                    if not dom_exploration_enabled
+                    else ""
+                )
+                + learning_ctx
+                + f"Accessibility Tree:\n{json.dumps(accessibility_tree, indent=2)}\n\n"
+                f"Previous flows discovered: {len(state['discovered_flows'])}\n"
+                f"Visited URLs: {len(state['visited_urls'])}\n\n"
+                "What user flows and interactive elements should be tested next? "
+                "Analyse both the accessibility tree and the screenshot carefully."
+            )
+
+            if screenshot_b64:
+                human_message = HumanMessage(
+                    content=[
+                        {"type": "text", "text": text_content},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{screenshot_b64}"
+                            },
+                        },
+                    ]
+                )
+            else:
+                human_message = HumanMessage(content=text_content)
+
             messages = [
-                ("system", self.SYSTEM_PROMPT),
-                (
-                    "human",
-                    f"""Page: {page_title}
-URL: {current_url}
-
-Accessibility Tree:
-{json.dumps(accessibility_tree, indent=2)}
-
-Previous flows discovered: {len(state["discovered_flows"])}
-Visited URLs: {len(state["visited_urls"])}
-
-What user flows and interactive elements should be tested next?""",
-                ),
+                SystemMessage(content=self.SYSTEM_PROMPT),
+                human_message,
             ]
 
             try:
                 response = await self.llm.ainvoke(messages)
                 self._track_llm_usage(state, 1000)  # Approximate
+                self._record_llm_turn(state, "explorer", text_content, str(response.content))
+
+                # Record learning from explorer's observations
+                resp_str = str(response.content)[:300]
+                self._record_learning(state, f"Explorer on {current_url}: {resp_str}")
 
                 # Parse LLM response
                 try:
-                    actions = json.loads(response.content)
-                except:
+                    actions = _parse_llm_json(response.content)
+                    # Normalize: some LLMs return a list directly instead of {"discoveries": [...]}
+                    if isinstance(actions, list):
+                        actions = {"discoveries": actions}
+                except Exception:
                     actions = {"discoveries": []}
 
                 # Create a new flow if needed
@@ -204,19 +527,20 @@ What user flows and interactive elements should be tested next?""",
             if not state["current_flow"]:
                 state["current_flow"] = flow
 
-        for hint in self._flow_hints_from_actions(available_actions):
-            if hint.lower() in known_flows:
-                continue
-            flow = UserFlow(
-                flow_id=f"flow_{state['current_step']}_{len(state['discovered_flows'])}",
-                name=hint,
-                description=f"Interact with {hint.lower().replace(' flow', '')}",
-                start_url=current_url,
-            )
-            state["discovered_flows"].append(flow)
-            known_flows.add(hint.lower())
-            if not state["current_flow"]:
-                state["current_flow"] = flow
+        if dom_exploration_enabled:
+            for hint in self._flow_hints_from_actions(available_actions):
+                if hint.lower() in known_flows:
+                    continue
+                flow = UserFlow(
+                    flow_id=f"flow_{state['current_step']}_{len(state['discovered_flows'])}",
+                    name=hint,
+                    description=f"Interact with {hint.lower().replace(' flow', '')}",
+                    start_url=current_url,
+                )
+                state["discovered_flows"].append(flow)
+                known_flows.add(hint.lower())
+                if not state["current_flow"]:
+                    state["current_flow"] = flow
 
         # Track visited URL
         if current_url not in state["visited_urls"]:
@@ -282,16 +606,22 @@ class TesterAgent(BaseAgent):
 
     INTENT_KEYWORDS: Dict[str, set[str]] = {
         "auth": {"login", "log in", "sign in", "signin", "signup", "sign up", "register", "password", "forgot"},
-        "services": {"service", "services", "offering", "offerings", "package", "packages", "catalog"},
-        "appointments": {"appointment", "appointments", "booking", "book", "reserve", "reservation", "session"},
-        "calendar": {"calendar", "schedule", "timeslot", "timeslots", "availability", "slot", "slots"},
-        "staff": {"staff", "team", "member", "members", "employee", "employees", "personnel", "provider"},
-        "clients": {"client", "clients", "customer", "customers", "guest", "guests", "contact", "contacts"},
+        "navigation": {"menu", "dashboard", "home", "page", "section", "tab", "view"},
+        "crud": {"create", "new", "add", "edit", "update", "delete", "save", "submit", "confirm"},
+        "search": {"search", "filter", "find", "query", "lookup"},
+        "forms": {"form", "input", "field", "required", "validation"},
         "settings": {"setting", "settings", "config", "configuration", "preference", "preferences", "integration", "integrations", "payment", "payments", "billing"},
         "content": {"brand", "website", "page", "pages", "forms", "preview"},
     }
 
-    SYSTEM_PROMPT = """You are an expert web QA tester. Execute actions on web pages and generate realistic test data.
+    SYSTEM_PROMPT = """You are an expert web QA tester with visual understanding. You receive a screenshot of the current page alongside structured action data.
+
+Use the screenshot to:
+- See which form fields are already filled vs. empty
+- Spot error banners, validation messages, or toast notifications
+- Detect loading spinners, disabled buttons, or blocked states
+- Identify modals or overlays that need to be dismissed before proceeding
+- Understand the overall visual layout and current step in a multi-step flow
 
 When generating inputs:
 1. Use realistic data (valid emails, phone numbers, etc.)
@@ -317,9 +647,9 @@ Respond in JSON format."""
         if bool(testing_cfg.get("email_verification_enabled", False)):
             self.email_service = DynamicEmailService(
                 {
-                    "provider": testing_cfg.get("email_provider", "1secmail"),
+                    "provider": testing_cfg.get("email_provider", "guerrillamail"),
                     "base_url": testing_cfg.get(
-                        "email_provider_base_url", "https://www.1secmail.com/api/v1/"
+                        "email_provider_base_url", "https://api.guerrillamail.com/ajax.php"
                     ),
                     "request_timeout_seconds": testing_cfg.get("email_request_timeout_seconds", 12.0),
                 }
@@ -329,14 +659,40 @@ Respond in JSON format."""
         """Execute test actions on the current page."""
         page = state["browser"]
         mcp_client = state["mcp_client"]
+
+        # Sync state URL from the live browser so we always act on the actual current page,
+        # not the stale URL last written by ExplorerAgent (explorer only runs every 10 steps).
+        live_url = page.url
+        if live_url and live_url != state.get("current_url"):
+            state["current_url"] = live_url
+            if live_url not in state["visited_urls"]:
+                state["visited_urls"].append(live_url)
+            # New URL detected — wait for the page to fully render before fetching
+            # actions. This is critical for React SPAs that fetch data and render
+            # form fields asynchronously after the URL change.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=4000)
+            except Exception:
+                pass
+        # Always give React pages a moment to settle before reading the DOM.
+        # This prevents empty action lists on freshly-navigated URLs.
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=2000)
+        except Exception:
+            pass
+
         testing_cfg = self.config.get("testing", {})
         hidden_menu_expander_enabled = bool(testing_cfg.get("hidden_menu_expander", True))
+        dom_exploration_enabled = bool(testing_cfg.get("dom_exploration_enabled", True))
         form_validation_pass_enabled = bool(testing_cfg.get("form_validation_pass", True))
         deep_traversal_enabled = bool(testing_cfg.get("deep_traversal", True))
         email_verification_enabled = bool(testing_cfg.get("email_verification_enabled", False))
 
         step_num = len(state["test_results"]) + 1
         artifacts = state.setdefault("artifacts", {})
+        objective_text = self._primary_objective_text()
+        strict_objective = self._objective_is_strict()
+        validation_exploration_enabled = self._should_run_validation_exploration(objective_text)
         auth_progress = artifacts.setdefault(
             "auth_progress",
             {
@@ -370,7 +726,7 @@ Respond in JSON format."""
         mutation_assertions = artifacts.setdefault(
             "mutation_assertions",
             {
-                "required_entities": ["service", "staff", "appointment"],
+                "required_entities": sorted(self._objective_intents_to_entities()),
                 "detected_entities": [],
                 "checked_submits": 0,
             },
@@ -387,23 +743,39 @@ Respond in JSON format."""
 
         try:
             url_key = self._url_key(str(state.get("current_url", "")))
-            if hidden_menu_expander_enabled and url_key and url_key not in expanded_menu_urls:
+            if (
+                dom_exploration_enabled
+                and hidden_menu_expander_enabled
+                and url_key
+                and url_key not in expanded_menu_urls
+            ):
                 expanded_count = await self._run_hidden_menu_expander_pass(page)
                 if expanded_count > 0:
                     expanded_menu_urls.add(url_key)
 
+            # ── Vision-first page analysis ────────────────────────────
+            # Always start by having the LLM visually interpret the page.
+            # The result informs page classification and action selection.
+            vision_analysis = None
+            if self._has_llm_configured():
+                vision_analysis = await self._vision_analyze_page(state, page)
+
             # Get available actions from MCP
             actions = await mcp_client.get_available_actions(page)
-            context = self._classify_page_context(state, actions)
+            context = self._classify_page_context(state, actions, vision_analysis=vision_analysis)
             flow_key = self._flow_signature(context, state)
 
-            if context != "general" and int(flow_attempt_counts.get(flow_key, 0)) >= 3:
+            # Allow more attempts for auth flows that have multiple required field-fill steps
+            # (email, password, name fields, phone, submit), so they need more than 3 attempts.
+            # General non-auth contexts keep the 3-attempt guard against infinite loops.
+            max_flow_attempts = 12 if context in {"signup", "signin"} else 3
+            if context != "general" and int(flow_attempt_counts.get(flow_key, 0)) >= max_flow_attempts:
                 if state.get("current_flow"):
                     state["current_flow"].status = "completed"
                     state["current_flow"].end_url = state.get("current_url", "")
                     state["current_flow"] = None
                 state["errors"].append(
-                    f"Skipping over-tested flow after 3 attempts: {context} @ {state.get('current_url', '')}"
+                    f"Skipping over-tested flow after {max_flow_attempts} attempts: {context} @ {state.get('current_url', '')}"
                 )
                 state["current_step"] += 1
                 return state
@@ -417,6 +789,14 @@ Respond in JSON format."""
                 action_attempt_counts,
             )
 
+            before_full_path: Optional[str] = None
+            before_crop_path: Optional[str] = None
+            before_bbox: Optional[Dict[str, float]] = None
+            after_full_path: Optional[str] = None
+            after_crop_path: Optional[str] = None
+            after_bbox: Optional[Dict[str, float]] = None
+            duration = 0
+
             if auth_step is not None:
                 action_plan, result = auth_step
                 action_signature = self._action_signature(action_plan)
@@ -427,20 +807,77 @@ Respond in JSON format."""
                     state["current_step"] += 1
                     return state
 
-                form_action = self._build_form_validation_action(
-                    state,
-                    actions,
-                    generated_user,
-                    form_validation_state,
-                    action_attempt_counts,
+                objective_text = self._primary_objective_text().lower()
+                objective_targets_signup = any(
+                    token in objective_text for token in ["sign up", "signup", "register", "create account"]
+                )
+                auth_credentials = self._auth_credentials_available()
+                current_url_lower = str(state.get("current_url", "")).lower()
+                login_surface = any(
+                    token in current_url_lower for token in ["/login", "/signin", "/sign-in", "/auth"]
+                )
+                # Also detect login forms from page content (handles root-URL login pages)
+                login_actions_present = not login_surface and any(
+                    any(tok in (a.get("text", "") + " " + a.get("selector", "")).lower()
+                        for tok in ["sign in", "log in", "login"])
+                    and a.get("type") in {"click", "select"}
+                    for a in actions[:20]
+                )
+                if objective_targets_signup and not auth_credentials and (login_surface or login_actions_present):
+                    signup_switch = self._pick_signup_switch_action(actions)
+                    if signup_switch is not None:
+                        action_plan = signup_switch
+                        action_signature = self._action_signature(action_plan)
+                        if int(action_attempt_counts.get(action_signature, 0)) >= 3:
+                            state["current_step"] += 1
+                            return state
+
+                        before_full_path, before_crop_path, before_bbox = await self._capture_step_visuals(
+                            state,
+                            page,
+                            step_num,
+                            action_plan,
+                            phase="before",
+                        )
+
+                        start_time = datetime.now()
+                        result = await mcp_client.execute_action(
+                            page,
+                            action_plan["action_type"],
+                            action_plan["target"],
+                            action_plan.get("value"),
+                        )
+                        duration = int((datetime.now() - start_time).total_seconds() * 1000)
+
+                        after_full_path, after_crop_path, after_bbox = await self._capture_step_visuals(
+                            state,
+                            page,
+                            step_num,
+                            action_plan,
+                            phase="after",
+                        )
+                    else:
+                        state["current_step"] += 1
+                        return state
+
+                forced_focus_action = (
+                    self._pick_obstruction_clear_action(actions) if strict_objective else None
                 )
 
-                if context == "general" and form_validation_pass_enabled and form_action is not None:
-                    action_plan = form_action
+                if forced_focus_action is not None:
+                    action_plan = forced_focus_action
                     action_signature = self._action_signature(action_plan)
                     if int(action_attempt_counts.get(action_signature, 0)) >= 3:
                         state["current_step"] += 1
                         return state
+
+                    before_full_path, before_crop_path, before_bbox = await self._capture_step_visuals(
+                        state,
+                        page,
+                        step_num,
+                        action_plan,
+                        phase="before",
+                    )
 
                     start_time = datetime.now()
                     result = await mcp_client.execute_action(
@@ -450,42 +887,210 @@ Respond in JSON format."""
                         action_plan.get("value"),
                     )
                     duration = int((datetime.now() - start_time).total_seconds() * 1000)
-                else:
-                    nav_action = self._pick_navigation_action(
+
+                    after_full_path, after_crop_path, after_bbox = await self._capture_step_visuals(
                         state,
-                        actions,
-                        action_attempt_counts,
-                        nav_labels_clicked,
-                        deep_traversal_state,
+                        page,
+                        step_num,
+                        action_plan,
+                        phase="after",
                     )
-                    current_url_lower = str(state.get("current_url", "")).lower()
-                    in_post_auth_surface = "/dashboard" in current_url_lower or "/app" in current_url_lower
-                    if context == "general" and in_post_auth_surface and nav_action is not None:
-                        action_plan = nav_action
-                    elif self._has_llm_configured():
-                        messages = [
-                            ("system", self.SYSTEM_PROMPT),
-                            (
-                                "human",
-                                f"""Current page: {state["page_title"]}
-URL: {state["current_url"]}
+                else:
+                        nav_action = self._pick_navigation_action(
+                            state,
+                            actions,
+                            action_attempt_counts,
+                            nav_labels_clicked,
+                            deep_traversal_state,
+                        )
+                        in_post_auth_surface = "/dashboard" in current_url_lower or "/app" in current_url_lower
 
-Available actions:
-{json.dumps(actions[:10], indent=2)}
+                        # Detect if the current page is a form/onboarding step that
+                        # doesn't match the auth sequence (e.g. create-business, profile
+                        # setup, custom wizards). Use vision-guided form filling so the
+                        # agent can understand any app without hardcoded selectors.
+                        # Check this BEFORE form-validation so post-signup onboarding
+                        # forms get vision-guided filling rather than generic validation.
+                        has_visible_form = any(
+                            a.get("type") in {"type", "select", "check"}
+                            or a.get("role") in {"combobox", "listbox", "textbox", "checkbox", "radio", "switch"}
+                            for a in actions[:20]
+                        )
+                        # Exclude dashboard/app URLs from the onboarding surface — once
+                        # the user is on the dashboard the "create business" goal is done.
+                        current_url_str = str(state.get("current_url", ""))
+                        _on_dashboard = "/dashboard" in current_url_str or "/app/" in current_url_str
+                        in_onboarding_surface = has_visible_form and context in ("general", "signup") and not _on_dashboard
+                        print(f"[FORM-CHECK] url={current_url_str} has_visible_form={has_visible_form} in_onboarding={in_onboarding_surface} action_types={[(a.get('type'), a.get('role'), a.get('input_type')) for a in actions[:10]]}", flush=True)
 
-Test step {step_num} of {state["max_steps"]}
+                        form_action = self._build_form_validation_action(
+                            state,
+                            actions,
+                            generated_user,
+                            form_validation_state,
+                            action_attempt_counts,
+                        )
 
-Which action should be executed next? Consider coverage and discovering new flows.""",
-                            ),
-                        ]
+                        if (
+                            context == "general"
+                            and form_validation_pass_enabled
+                            and validation_exploration_enabled
+                            and form_action is not None
+                            and not in_onboarding_surface
+                            and (not strict_objective or self._action_plan_matches_objective(form_action))
+                        ):
+                            action_plan = form_action
+                            action_signature = self._action_signature(action_plan)
+                            if int(action_attempt_counts.get(action_signature, 0)) >= 3:
+                                state["current_step"] += 1
+                                return state
 
-                        try:
-                            response = await self.llm.ainvoke(messages)
-                            self._track_llm_usage(state, 500)
+                            before_full_path, before_crop_path, before_bbox = await self._capture_step_visuals(
+                                state,
+                                page,
+                                step_num,
+                                action_plan,
+                                phase="before",
+                            )
+
+                            start_time = datetime.now()
+                            result = await mcp_client.execute_action(
+                                page,
+                                action_plan["action_type"],
+                                action_plan["target"],
+                                action_plan.get("value"),
+                            )
+                            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+
+                            after_full_path, after_crop_path, after_bbox = await self._capture_step_visuals(
+                                state,
+                                page,
+                                step_num,
+                                action_plan,
+                                phase="after",
+                            )
+                        elif context == "general" and in_post_auth_surface and nav_action is not None and not has_visible_form:
+                            action_plan = nav_action
+                        elif in_onboarding_surface and self._has_llm_configured():
+                            print(f"[ONBOARD] url={state.get('current_url')} actions={[a.get('selector') or a.get('text') or a.get('type') for a in actions[:20]]} roles={[a.get('role','') for a in actions[:20]]}", flush=True)
+                            vision_plan = await self._run_vision_guided_form_step(
+                                state, page, actions, generated_user, recent_actions,
+                                action_attempt_counts=action_attempt_counts,
+                                is_navigation_context=False,
+                            )
+                            print(f"[ONBOARD] vision_plan={vision_plan}", flush=True)
+                            if vision_plan and isinstance(vision_plan, dict) and vision_plan.get("target"):
+                                action_plan = vision_plan
+                            else:
+                                action_plan = self._build_heuristic_action(
+                                    state, actions, generated_user, auth_progress,
+                                    auth_form_state, recent_actions, action_attempt_counts,
+                                )
+                        elif _on_dashboard and self._has_llm_configured():
+                            # On the dashboard/app, use vision-guided navigation to reach
+                            # the next sub-goal (e.g. create an appointment after creating a business).
+                            print(f"[NAV] url={state.get('current_url')} navigating toward next sub-goal", flush=True)
+                            vision_plan = await self._run_vision_guided_form_step(
+                                state, page, actions, generated_user, recent_actions,
+                                action_attempt_counts=action_attempt_counts,
+                                is_navigation_context=True,
+                            )
+                            print(f"[NAV] vision_plan={vision_plan}", flush=True)
+                            if vision_plan and isinstance(vision_plan, dict) and vision_plan.get("target"):
+                                action_plan = vision_plan
+                            else:
+                                action_plan = nav_action or self._build_heuristic_action(
+                                    state, actions, generated_user, auth_progress,
+                                    auth_form_state, recent_actions, action_attempt_counts,
+                                )
+                        elif not dom_exploration_enabled and self._has_llm_configured():
+                            action_plan = await self._build_visual_first_action(
+                                state,
+                                page,
+                                actions,
+                                generated_user,
+                                auth_progress,
+                                auth_form_state,
+                                recent_actions,
+                                action_attempt_counts,
+                            )
+                        elif self._has_llm_configured():
+                            # General LLM path — enriched with sub-goal tracking.
+                            tester_screenshot_b64: Optional[str] = None
+                            try:
+                                tester_screenshot_bytes = await page.screenshot(type="png", full_page=False)
+                                tester_screenshot_b64 = base64.b64encode(tester_screenshot_bytes).decode("utf-8")
+                            except Exception:
+                                pass
+
+                            visited_urls_for_tester: List[str] = list(state.get("visited_urls", []))
+                            active_subgoal_for_tester = self._infer_active_subgoal(
+                                objective_text or "", visited_urls_for_tester
+                            )
+                            visited_summary_tester = ", ".join(
+                                str(u).replace("https://", "").split("?")[0]
+                                for u in visited_urls_for_tester[-6:]
+                            )
+
+                            tester_learning_ctx = self._build_learning_context(state)
+                            tester_text = (
+                                f"Current page: {state['page_title']}\n"
+                                f"URL: {state['current_url']}\n"
+                                f"Full objective: {objective_text or 'None'}\n"
+                                f"Current active goal: {active_subgoal_for_tester}\n"
+                                f"Pages already visited: {visited_summary_tester}\n\n"
+                                + tester_learning_ctx
+                                + f"Available actions:\n{json.dumps(actions[:15], indent=2)}\n\n"
+                                f"Test step {step_num} of {state['max_steps']}\n\n"
+                                "Look at the screenshot to understand the current visual state of the page "
+                                "(filled fields, error messages, loading indicators, modals, etc). "
+                                "Then choose the next action that most directly advances the CURRENT ACTIVE GOAL. "
+                                "If a blocking modal or tour overlay is present, dismiss it first. "
+                                "Return JSON with: action_type, target, value, reasoning."
+                            )
+
+                            if tester_screenshot_b64:
+                                human_msg = HumanMessage(content=[
+                                    {"type": "text", "text": tester_text},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{tester_screenshot_b64}"}},
+                                ])
+                            else:
+                                human_msg = HumanMessage(content=tester_text)
+
+                            messages = [
+                                SystemMessage(content=self.SYSTEM_PROMPT),
+                                human_msg,
+                            ]
 
                             try:
-                                action_plan = json.loads(response.content)
-                            except Exception:
+                                response = await self.llm.ainvoke(messages)
+                                self._track_llm_usage(state, 800)
+                                self._record_llm_turn(state, "tester", tester_text, str(response.content))
+
+                                # Record tester's reasoning as a learning
+                                try:
+                                    action_plan = _parse_llm_json(response.content)
+                                    reasoning = action_plan.get("reasoning", "")[:150] if isinstance(action_plan, dict) else ""
+                                    if reasoning:
+                                        self._record_learning(state, f"Tester decided: {reasoning}")
+                                except Exception:
+                                    action_plan = self._build_heuristic_action(
+                                        state,
+                                        actions,
+                                        generated_user,
+                                        auth_progress,
+                                        auth_form_state,
+                                        recent_actions,
+                                        action_attempt_counts,
+                                    )
+                            except Exception as e:
+                                if self._is_llm_auth_error(e):
+                                    self._disable_llm(
+                                        state,
+                                        "LLM provider authentication failed. Continuing in adaptive heuristic mode.",
+                                    )
+                                else:
+                                    state["errors"].append(f"Tester LLM error: {e}")
                                 action_plan = self._build_heuristic_action(
                                     state,
                                     actions,
@@ -495,14 +1100,7 @@ Which action should be executed next? Consider coverage and discovering new flow
                                     recent_actions,
                                     action_attempt_counts,
                                 )
-                        except Exception as e:
-                            if self._is_llm_auth_error(e):
-                                self._disable_llm(
-                                    state,
-                                    "LLM provider authentication failed. Continuing in adaptive heuristic mode.",
-                                )
-                            else:
-                                state["errors"].append(f"Tester LLM error: {e}")
+                        else:
                             action_plan = self._build_heuristic_action(
                                 state,
                                 actions,
@@ -512,31 +1110,71 @@ Which action should be executed next? Consider coverage and discovering new flow
                                 recent_actions,
                                 action_attempt_counts,
                             )
-                    else:
-                        action_plan = self._build_heuristic_action(
-                            state,
+
+                        if (
+                            strict_objective
+                            and objective_text
+                            and any(self._action_matches_objective(action) for action in actions)
+                            and not self._action_plan_matches_objective(action_plan)
+                        ):
+                            action_plan = self._build_heuristic_action(
+                                state,
+                                actions,
+                                generated_user,
+                                auth_progress,
+                                auth_form_state,
+                                recent_actions,
+                                action_attempt_counts,
+                            )
+
+                        pre_submit_fill_action = self._build_pre_submit_fill_action(
                             actions,
+                            action_plan,
                             generated_user,
-                            auth_progress,
-                            auth_form_state,
-                            recent_actions,
                             action_attempt_counts,
                         )
+                        if pre_submit_fill_action is not None:
+                            action_plan = pre_submit_fill_action
 
-                    action_signature = self._action_signature(action_plan)
-                    if int(action_attempt_counts.get(action_signature, 0)) >= 3:
-                        state["errors"].append(
-                            f"Skipping repeated action after 3 attempts: {action_signature}"
+                        action_signature = self._action_signature(action_plan)
+                        if int(action_attempt_counts.get(action_signature, 0)) >= 3:
+                            state["errors"].append(
+                                f"Skipping repeated action after 3 attempts: {action_signature}"
+                            )
+                            state["current_step"] += 1
+                            return state
+
+                        before_full_path, before_crop_path, before_bbox = await self._capture_step_visuals(
+                            state,
+                            page,
+                            step_num,
+                            action_plan,
+                            phase="before",
                         )
-                        state["current_step"] += 1
-                        return state
 
-                    # Execute the action via MCP
-                    start_time = datetime.now()
-                    result = await mcp_client.execute_action(
-                        page, action_plan["action_type"], action_plan["target"], action_plan.get("value")
-                    )
-                    duration = int((datetime.now() - start_time).total_seconds() * 1000)
+                        # Execute the action via MCP
+                        start_time = datetime.now()
+                        result = await mcp_client.execute_action(
+                            page, action_plan["action_type"], action_plan["target"], action_plan.get("value")
+                        )
+                        duration = int((datetime.now() - start_time).total_seconds() * 1000)
+
+                        after_full_path, after_crop_path, after_bbox = await self._capture_step_visuals(
+                            state,
+                            page,
+                            step_num,
+                            action_plan,
+                            phase="after",
+                        )
+
+            if auth_step is not None:
+                after_full_path, after_crop_path, after_bbox = await self._capture_step_visuals(
+                    state,
+                    page,
+                    step_num,
+                    action_plan,
+                    phase="after",
+                )
 
             action_attempt_counts[action_signature] = int(action_attempt_counts.get(action_signature, 0)) + 1
             flow_attempt_counts[flow_key] = int(flow_attempt_counts.get(flow_key, 0)) + 1
@@ -596,10 +1234,37 @@ Which action should be executed next? Consider coverage and discovering new flow
                 action=action_plan["action_type"],
                 target=action_plan["target"],
                 status="success" if result.get("success") else "failed",
+                screenshot_path=after_full_path or before_full_path,
                 console_logs=console_logs,
                 network_logs=network_logs,
                 duration_ms=duration,
             )
+
+            # After action: sync current URL from the live browser so subsequent
+            # objective/surface checks in the same run see the post-navigation page.
+            post_action_url = page.url
+            if post_action_url and post_action_url != state.get("current_url"):
+                state["current_url"] = post_action_url
+                if post_action_url not in state["visited_urls"]:
+                    state["visited_urls"].append(post_action_url)
+                # Wait for new page to render (SPA route change)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=4000)
+                except Exception:
+                    pass
+
+            step_visuals = artifacts.setdefault("step_visuals", {})
+            step_visual_entry: Dict[str, Any] = {
+                "before_full": before_full_path,
+                "before_crop": before_crop_path,
+                "after_full": after_full_path,
+                "after_crop": after_crop_path,
+            }
+            if before_bbox:
+                step_visual_entry["before_bbox"] = before_bbox
+            if after_bbox:
+                step_visual_entry["after_bbox"] = after_bbox
+            step_visuals[str(step_num)] = step_visual_entry
 
             if not result.get("success"):
                 step.error_message = result.get("error", "Action failed")
@@ -608,6 +1273,10 @@ Which action should be executed next? Consider coverage and discovering new flow
                     f"{action_plan['action_type']} on {action_plan['target']} - {result.get('error', 'Action failed')}"
                 )
                 state["errors"].append(error_detail)
+                self._record_learning(
+                    state,
+                    f"FAILED: {action_plan['action_type']} on {action_plan.get('target', '?')} — {result.get('error', '')[:100]}"
+                )
                 if result.get("trace"):
                     state["errors"].append(f"Trace: {result['trace']}")
 
@@ -624,10 +1293,50 @@ Which action should be executed next? Consider coverage and discovering new flow
                     + (", ".join(sorted(detected_entities)) if detected_entities else "none")
                 )
 
+            if mutation_assertion_failed:
+                ocr_fallback = await self._run_ocr_assertion_fallback(
+                    state,
+                    page,
+                    action_plan,
+                    expected_entities,
+                    missing_entities,
+                )
+                if ocr_fallback:
+                    step_visual_entry["ocr"] = ocr_fallback
+                    if ocr_fallback.get("matched_expected"):
+                        step.status = "success"
+                        step.error_message = None
+                        mutation_assertion_failed = False
+
+            if step.status == "failed":
+                annotation_bbox = after_bbox or before_bbox
+                source_path = after_full_path or before_full_path
+                annotated_path = self._create_annotated_failure_image(
+                    source_path,
+                    annotation_bbox,
+                    step.error_message,
+                    step_num,
+                )
+                if annotated_path:
+                    step_visual_entry["annotated_failure"] = annotated_path
+
             if verification_note:
                 state["errors"].append(verification_note)
 
             state["test_results"].append(step)
+
+            if (
+                strict_objective
+                and step.status == "success"
+                and self._is_submit_like_action(action_plan)
+                and self._action_plan_matches_objective(action_plan)
+                and (
+                    not objective_text
+                    or not self._objective_intents()
+                    or self._objective_completion_reached(mutation_assertions)
+                )
+            ):
+                state["should_stop"] = True
 
             # Update current flow
             if state["current_flow"]:
@@ -651,6 +1360,291 @@ Which action should be executed next? Consider coverage and discovering new flow
 
         return state
 
+    async def _capture_step_visuals(
+        self,
+        state: GraphState,
+        page: Any,
+        step_num: int,
+        action_plan: Dict[str, Any],
+        phase: str,
+    ) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, float]]]:
+        """Capture full-page and target crop screenshots for one step phase."""
+        artifacts_dir = self._ensure_visual_artifacts_dir(state)
+        if artifacts_dir is None:
+            return None, None, None
+
+        full_path = artifacts_dir / f"step_{step_num:04d}_{phase}_full.png"
+        crop_path = artifacts_dir / f"step_{step_num:04d}_{phase}_crop.png"
+
+        full_result: Optional[str] = None
+        crop_result: Optional[str] = None
+        bbox: Optional[Dict[str, float]] = None
+
+        try:
+            await page.screenshot(path=str(full_path), type="png", full_page=True)
+            full_result = str(full_path)
+        except Exception:
+            full_result = None
+
+        try:
+            bbox = await self._find_target_bbox(page, str(action_plan.get("target", "")))
+            if bbox:
+                clip = {
+                    "x": max(0.0, float(bbox.get("x", 0.0))),
+                    "y": max(0.0, float(bbox.get("y", 0.0))),
+                    "width": max(4.0, float(bbox.get("width", 4.0))),
+                    "height": max(4.0, float(bbox.get("height", 4.0))),
+                }
+                await page.screenshot(path=str(crop_path), type="png", clip=clip)
+                crop_result = str(crop_path)
+        except Exception:
+            crop_result = None
+
+        return full_result, crop_result, bbox
+
+    def _ensure_visual_artifacts_dir(self, state: GraphState) -> Optional[Path]:
+        """Ensure visual artifacts output directory exists."""
+        output_dir = (
+            self.config.get("testing", {}).get("output_dir")
+            or state.get("config", {}).get("testing", {}).get("output_dir")
+            or "./reports"
+        )
+        try:
+            artifacts_dir = Path(str(output_dir)) / "visual_artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            return artifacts_dir
+        except Exception:
+            return None
+
+    async def _find_target_bbox(self, page: Any, target: str) -> Optional[Dict[str, float]]:
+        """Best-effort attempt to resolve target element bbox for crop capture."""
+        if not target:
+            return None
+
+        candidates = [target.strip()]
+        seen = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+
+            try:
+                locator = page.locator(candidate).first
+                count = await locator.count()
+                if count > 0:
+                    bbox = await locator.bounding_box()
+                    if bbox and bbox.get("width", 0) > 0 and bbox.get("height", 0) > 0:
+                        return {
+                            "x": float(bbox["x"]),
+                            "y": float(bbox["y"]),
+                            "width": float(bbox["width"]),
+                            "height": float(bbox["height"]),
+                        }
+            except Exception:
+                pass
+
+            try:
+                text_locator = page.get_by_text(candidate, exact=False).first
+                text_count = await text_locator.count()
+                if text_count > 0:
+                    bbox = await text_locator.bounding_box()
+                    if bbox and bbox.get("width", 0) > 0 and bbox.get("height", 0) > 0:
+                        return {
+                            "x": float(bbox["x"]),
+                            "y": float(bbox["y"]),
+                            "width": float(bbox["width"]),
+                            "height": float(bbox["height"]),
+                        }
+            except Exception:
+                pass
+
+        return None
+
+    async def _run_ocr_assertion_fallback(
+        self,
+        state: GraphState,
+        page: Any,
+        action_plan: Dict[str, Any],
+        expected_entities: set[str],
+        missing_entities: set[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Use Gemini vision as OCR fallback when DOM/mutation evidence is inconclusive."""
+        if not self._has_llm_configured():
+            return None
+
+        try:
+            screenshot_bytes = await page.screenshot(type="png", full_page=False)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            return None
+
+        expected_list = sorted(str(value) for value in expected_entities)
+        missing_list = sorted(str(value) for value in missing_entities)
+        prompt = (
+            "Perform OCR and UI-state verification for this web QA step. "
+            "Return strict JSON with keys: matched_expected (bool), confidence (low|medium|high), "
+            "summary (string), evidence_keywords (array of strings).\n"
+            f"Action type: {action_plan.get('action_type')}\n"
+            f"Action target: {action_plan.get('target')}\n"
+            f"Expected entities: {expected_list}\n"
+            f"Missing entities from DOM/network checks: {missing_list}\n"
+            "If visible confirmation text suggests success despite missing DOM mutation evidence, "
+            "set matched_expected=true."
+        )
+
+        try:
+            response = await self.llm.ainvoke(
+                [
+                    SystemMessage(
+                        content="You are a precise OCR and UI-verification assistant for web QA. Return JSON only."
+                    ),
+                    HumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                            },
+                        ]
+                    ),
+                ]
+            )
+            self._track_llm_usage(state, 800)
+            self._record_llm_turn(state, "tester/ocr", prompt, str(response.content))
+        except Exception:
+            return None
+
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            json_match = re.search(r"\{[\s\S]*\}", content)
+            if not json_match:
+                return None
+            try:
+                parsed = json.loads(json_match.group(0))
+            except Exception:
+                return None
+
+        return {
+            "matched_expected": bool(parsed.get("matched_expected", False)),
+            "confidence": str(parsed.get("confidence", "low")),
+            "summary": str(parsed.get("summary", "")).strip(),
+            "evidence_keywords": [str(item) for item in parsed.get("evidence_keywords", [])],
+        }
+
+    def _create_annotated_failure_image(
+        self,
+        source_image_path: Optional[str],
+        bbox: Optional[Dict[str, float]],
+        error_message: Optional[str],
+        step_num: int,
+    ) -> Optional[str]:
+        """Create annotated failure image with bbox highlight and failure label."""
+        if not source_image_path:
+            return None
+
+        source_path = Path(source_image_path)
+        if not source_path.exists():
+            return None
+
+        annotated_path = source_path.with_name(f"step_{step_num:04d}_annotated_failure.png")
+
+        try:
+            image = Image.open(source_path).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            width, _ = image.size
+
+            if bbox:
+                x = float(bbox.get("x", 0.0))
+                y = float(bbox.get("y", 0.0))
+                box_width = float(bbox.get("width", 0.0))
+                box_height = float(bbox.get("height", 0.0))
+                draw.rectangle(
+                    [x, y, x + box_width, y + box_height],
+                    outline=(220, 38, 38),
+                    width=4,
+                )
+
+            label = f"Step {step_num} FAILED"
+            if error_message:
+                label = f"{label}: {error_message[:100]}"
+
+            label_y = 10
+            draw.rectangle([(8, label_y), (width - 8, label_y + 32)], fill=(220, 38, 38))
+            draw.text((14, label_y + 8), label, fill=(255, 255, 255))
+
+            image.save(annotated_path, format="PNG")
+            return str(annotated_path)
+        except Exception:
+            return None
+
+    async def _vision_analyze_page(
+        self,
+        state: GraphState,
+        page: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Vision-first page analysis — runs before every action to understand the page.
+
+        Returns a structured dict with page_type, visible_fields, recommended_action, etc.
+        The result feeds into _classify_page_context() and action planning so every
+        decision is grounded in what the LLM actually sees on screen.
+        """
+        if not self._has_llm_configured():
+            return None
+
+        try:
+            screenshot_bytes = await page.screenshot(type="png", full_page=False)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            return None
+
+        objective = self._primary_objective_text()
+        prompt = (
+            "Analyze this web page screenshot. Return ONLY valid JSON with these keys:\n"
+            "- page_type: one of 'login', 'signup', 'forgot_password', 'form', 'dashboard', 'landing', 'error', 'other'\n"
+            "- visible_fields: array of objects {type, label, filled} for each form field visible on screen\n"
+            "  field type must be one of: text, email, password, number, date, time, datetime, select, checkbox, radio, toggle, textarea, phone, file, range\n"
+            "- has_modal: boolean — true if a modal/overlay/dialog is blocking the main content\n"
+            "- recommended_action: one sentence describing the best next step to advance the goal\n"
+            "- page_summary: one sentence describing what the page currently shows\n\n"
+            f"URL: {state.get('current_url', '')}\n"
+            f"Page title: {state.get('page_title', '')}\n"
+            f"Objective: {objective or 'Explore and test the application'}\n"
+        )
+
+        try:
+            response = await self.llm.ainvoke(
+                [
+                    SystemMessage(
+                        content="You are a precise web page analyzer for QA testing. Return only valid JSON — no markdown fences, no prose."
+                    ),
+                    HumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                            },
+                        ]
+                    ),
+                ]
+            )
+            self._track_llm_usage(state, 600)
+            self._record_llm_turn(state, "tester/vision-analyze", prompt, str(response.content))
+            result = _parse_llm_json(response.content)
+            print(
+                f"[VISION] page_type={result.get('page_type')} "
+                f"fields={len(result.get('visible_fields', []))} "
+                f"modal={result.get('has_modal')} "
+                f"summary={str(result.get('page_summary', ''))[:80]}",
+                flush=True,
+            )
+            return result
+        except Exception as exc:
+            print(f"[VISION] analysis failed: {exc}", flush=True)
+            return None
+
     async def _run_auth_sequence_step(
         self,
         page: Any,
@@ -660,13 +1654,173 @@ Which action should be executed next? Consider coverage and discovering new flow
         action_attempt_counts: Dict[str, int],
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """Execute one deterministic auth step to prevent getting stuck on login inputs."""
-        if context not in {"signin", "signup"}:
+        print(f"[AUTH-SEQ] context={context!r} url={page.url!r} form_state={auth_form_state}", flush=True)
+
+        auth_credentials = self._auth_credentials_available()
+
+        objective_text = self._primary_objective_text().lower()
+        objective_targets_signup = any(
+            token in objective_text
+            for token in ["sign up", "signup", "register", "create account"]
+        )
+        should_force_signup = objective_targets_signup or not auth_credentials
+
+        # When the page is classified as "forgot" but we want signup, treat it as a
+        # login surface that needs switching. For truly non-auth pages skip entirely.
+        if context == "forgot" and should_force_signup:
+            context = "signin"  # re-classify so signup-switch logic fires below
+            print(f"[AUTH-SEQ] reclassified forgot→signin (objective targets signup)", flush=True)
+        elif context not in {"signin", "signup"}:
+            print(f"[AUTH-SEQ] skipping — context {context!r} not in signin/signup", flush=True)
             return None
+
+        current_url = ""
+        try:
+            current_url = str(page.url).lower()
+        except Exception:
+            current_url = ""
+        login_surface = any(token in current_url for token in ["/login", "/signin", "/sign-in", "/auth"])
+        signup_surface = any(token in current_url for token in ["/sign-up", "/signup", "/register"])
+
+        # ── Auth-state recalibration ─────────────────────────────────────
+        # If we navigated to a signup page (via link click or redirect) but the
+        # form state still thinks email/password are filled from a different page,
+        # detect this by checking whether the email input is actually blank.
+        # Only recalibrate when we land on a DIFFERENT signup URL (not the same
+        # page re-rendering).
+        _prev_signup_url = auth_form_state.get("_last_signup_url", "")
+        _current_url_str = str(page.url).lower()
+        needs_recalibration = False
+        if signup_surface and (auth_form_state.get("submitted") or auth_form_state.get("email_filled")):
+            if _prev_signup_url != _current_url_str:
+                needs_recalibration = True
+        if needs_recalibration:
+            try:
+                email_el = page.locator(
+                    'input[name*="email" i], input[placeholder*="email" i], input[type="email"]'
+                ).first
+                if await email_el.count() > 0:
+                    val = await email_el.input_value(timeout=800)
+                    if not val:  # Form is empty — we haven't filled it yet on this page
+                        auth_form_state["email_filled"] = False
+                        auth_form_state["password_filled"] = False
+                        auth_form_state["submitted"] = False
+                        auth_form_state["submit_attempts"] = 0
+                        for key in list(action_attempt_counts.keys()):
+                            if "auth_signup_" in key:
+                                del action_attempt_counts[key]
+                        print(f"[AUTH-SEQ] recalibrated form state for new signup page", flush=True)
+            except Exception:
+                pass
+
+        # Track current signup URL to prevent repeated recalibration on same page
+        if signup_surface:
+            auth_form_state["_last_signup_url"] = _current_url_str
+
+        # Detect login forms by visible page content, not just URL tokens.
+        # Many apps serve their login form at the root URL (no /login path).
+        page_has_login_form = False
+        if should_force_signup and not login_surface and not signup_surface:
+            try:
+                for _sel in [
+                    'button:has-text("Sign in")',
+                    'button:has-text("Log in")',
+                    'button:has-text("Login")',
+                    'input[value*="Sign in" i]',
+                    'input[value*="Log in" i]',
+                    'input[value*="Login" i]',
+                ]:
+                    _loc = page.locator(_sel).first
+                    if await _loc.count() > 0 and await _loc.is_visible():
+                        page_has_login_form = True
+                        break
+            except Exception:
+                pass
+
+        if should_force_signup and (context == "signin" or login_surface or page_has_login_form):
+            switch_signup_action = {
+                "action_type": "click",
+                "target": "auth_switch_to_signup_link",
+                "value": "",
+            }
+            sw_attempts = int(action_attempt_counts.get(self._action_signature(switch_signup_action), 0))
+            print(f"[AUTH-SEQ] switch-to-signup: url={page.url!r} login_surface={login_surface} page_has_login_form={page_has_login_form} sw_attempts={sw_attempts}", flush=True)
+            if sw_attempts < 3:
+                switched = await self._click_first_visible(
+                    page,
+                    [
+                        'a:has-text("Sign up")',
+                        'a:has-text("Create account")',
+                        'a:has-text("Register")',
+                        'button:has-text("Sign up")',
+                        'button:has-text("Create account")',
+                        '[role="button"]:has-text("Sign up")',
+                        '[href*="sign-up" i]',
+                        '[href*="signup" i]',
+                        '[href*="register" i]',
+                    ],
+                )
+                print(f"[AUTH-SEQ] switched={switched} url_after={page.url!r}", flush=True)
+                if switched:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    return (
+                        switch_signup_action,
+                        {"success": True, "new_url": page.url},
+                    )
+            # Signup navigation not found or click attempts exhausted.
+            # Yield control to LLM / heuristic planning instead of falling
+            # through to fill the login form with signin credentials.
+            return None
+
+        if should_force_signup and login_surface:
+            return None
+
+        if context == "signup" and auth_credentials and not objective_targets_signup:
+            switch_signin_action = {
+                "action_type": "click",
+                "target": "auth_switch_to_signin_link",
+                "value": "",
+            }
+            if int(action_attempt_counts.get(self._action_signature(switch_signin_action), 0)) < 3:
+                switched = await self._click_first_visible(
+                    page,
+                    [
+                        'a:has-text("Sign in")',
+                        'a:has-text("Log in")',
+                        'a:has-text("Login")',
+                        'button:has-text("Sign in")',
+                        'button:has-text("Log in")',
+                        '[role="button"]:has-text("Sign in")',
+                        '[href*="login" i]',
+                        '[href*="signin" i]',
+                    ],
+                )
+                if switched:
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    return (
+                        switch_signin_action,
+                        {"success": True, "new_url": page.url},
+                    )
+
+        login_identity = generated_user
+        if auth_credentials:
+            auth_cfg = self.config.get("auth", {}) if isinstance(self.config, dict) else {}
+            login_identity = {
+                **generated_user,
+                "email": str(auth_cfg.get("email") or generated_user["email"]),
+                "password": str(auth_cfg.get("password") or generated_user["password"]),
+            }
 
         email_action = {
             "action_type": "type",
             "target": "auth_email_field",
-            "value": generated_user["email"],
+            "value": login_identity["email"],
         }
         if (
             not auth_form_state.get("email_filled")
@@ -678,11 +1832,12 @@ Which action should be executed next? Consider coverage and discovering new flow
                     'input[type="email"]',
                     'input[name*="email" i]',
                     'input[id*="email" i]',
+                    'input[placeholder*="email" i]',
                     'input[autocomplete="username"]',
                     'input[name*="user" i]',
                     'input[id*="user" i]',
                 ],
-                generated_user["email"],
+                login_identity["email"],
             )
             if success:
                 return (
@@ -693,7 +1848,7 @@ Which action should be executed next? Consider coverage and discovering new flow
         password_action = {
             "action_type": "type",
             "target": "auth_password_field",
-            "value": generated_user["password"],
+            "value": login_identity["password"],
         }
         if (
             not auth_form_state.get("password_filled")
@@ -708,7 +1863,7 @@ Which action should be executed next? Consider coverage and discovering new flow
                     'input[autocomplete="current-password"]',
                     'input[autocomplete="new-password"]',
                 ],
-                generated_user["password"],
+                login_identity["password"],
             )
             if success:
                 return (
@@ -716,62 +1871,894 @@ Which action should be executed next? Consider coverage and discovering new flow
                     {"success": True, "new_url": page.url},
                 )
 
+        if context == "signup":
+            # ── Confirm password (second password field) ──
+            confirm_pw_action = {
+                "action_type": "type",
+                "target": "auth_signup_confirm_password_field",
+                "value": login_identity["password"],
+            }
+            confirm_pw_sig = self._action_signature(confirm_pw_action)
+            if int(action_attempt_counts.get(confirm_pw_sig, 0)) < 2:
+                pw_fields = page.locator('input[type="password"]:visible')
+                pw_count = await pw_fields.count()
+                if pw_count >= 2:
+                    second_pw = pw_fields.nth(1)
+                    try:
+                        current_val = await second_pw.input_value(timeout=800)
+                    except Exception:
+                        current_val = ""
+                    if not current_val:
+                        try:
+                            await second_pw.scroll_into_view_if_needed(timeout=2000)
+                            await second_pw.fill(login_identity["password"], timeout=5000)
+                            try:
+                                await second_pw.press("Tab", timeout=1000)
+                            except Exception:
+                                pass
+                            action_attempt_counts[confirm_pw_sig] = int(action_attempt_counts.get(confirm_pw_sig, 0)) + 1
+                            print(f"[AUTH-SEQ] filled confirm password", flush=True)
+                            return (
+                                confirm_pw_action,
+                                {"success": True, "new_url": page.url},
+                            )
+                        except Exception:
+                            pass
+                action_attempt_counts[confirm_pw_sig] = int(action_attempt_counts.get(confirm_pw_sig, 0)) + 1
+
+            signup_profile_actions = [
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_first_name_field",
+                        "value": generated_user["first_name"],
+                    },
+                    [
+                        'input[name*="first" i]',
+                        'input[id*="first" i]',
+                        'input[placeholder*="first" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_last_name_field",
+                        "value": generated_user["last_name"],
+                    },
+                    [
+                        'input[name*="last" i]',
+                        'input[id*="last" i]',
+                        'input[placeholder*="last" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_phone_field",
+                        "value": "3478901234",
+                    },
+                    [
+                        'input[type="tel"]',
+                        'input[type="number"][name*="phone" i]',
+                        'input[type="number"][placeholder*="phone" i]',
+                        'input[name*="phone" i]',
+                        'input[id*="phone" i]',
+                        'input[placeholder*="phone" i]',
+                        'input[autocomplete="tel"]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_full_name_field",
+                        "value": generated_user["full_name"],
+                    },
+                    [
+                        'input[name*="full" i]',
+                        'input[id*="full" i]',
+                        'input[placeholder*="full name" i]',
+                        'input[name*="name" i]:not([name*="first" i]):not([name*="last" i])',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_business_field",
+                        "value": "Test Business",
+                    },
+                    [
+                        'input[name*="business" i]',
+                        'input[id*="business" i]',
+                        'input[placeholder*="business" i]',
+                        'input[name*="company" i]',
+                        'input[id*="company" i]',
+                        'input[placeholder*="company" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_dob_field",
+                        "value": "1990-01-15",
+                    },
+                    [
+                        'input[type="date"]',
+                        'input[name*="birth" i]',
+                        'input[name*="dob" i]',
+                        'input[id*="birth" i]',
+                        'input[id*="dob" i]',
+                        'input[placeholder*="date" i]',
+                        'input[placeholder*="birth" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_time_field",
+                        "value": "10:30",
+                    },
+                    [
+                        'input[type="time"]',
+                        'input[name*="time" i]',
+                        'input[id*="time" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_number_field",
+                        "value": "25",
+                    },
+                    [
+                        'input[type="number"]:not([name*="phone" i]):not([name*="otp" i]):not([name*="code" i])',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_address_field",
+                        "value": "123 Test Street",
+                    },
+                    [
+                        'input[name*="address" i]',
+                        'input[id*="address" i]',
+                        'input[placeholder*="address" i]',
+                        'textarea[name*="address" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "type",
+                        "target": "auth_signup_city_field",
+                        "value": "New York",
+                    },
+                    [
+                        'input[name*="city" i]',
+                        'input[id*="city" i]',
+                        'input[placeholder*="city" i]',
+                    ],
+                ),
+            ]
+
+            # Handle <select> dropdowns (country, gender, role, etc.)
+            select_profile_actions = [
+                (
+                    {
+                        "action_type": "select",
+                        "target": "auth_signup_country_select",
+                        "value": "",
+                    },
+                    [
+                        'select[name*="country" i]',
+                        'select[id*="country" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "select",
+                        "target": "auth_signup_gender_select",
+                        "value": "",
+                    },
+                    [
+                        'select[name*="gender" i]',
+                        'select[id*="gender" i]',
+                    ],
+                ),
+                (
+                    {
+                        "action_type": "select",
+                        "target": "auth_signup_role_select",
+                        "value": "",
+                    },
+                    [
+                        'select[name*="role" i]',
+                        'select[id*="role" i]',
+                        'select[name*="type" i]',
+                    ],
+                ),
+            ]
+
+            for action, selectors in signup_profile_actions:
+                sig = self._action_signature(action)
+                if int(action_attempt_counts.get(sig, 0)) >= 1:
+                    continue
+                success = await self._fill_first_visible(page, selectors, action["value"])
+                # Always count the attempt — even failures — to avoid infinite retry
+                action_attempt_counts[sig] = int(action_attempt_counts.get(sig, 0)) + 1
+                if success:
+                    return (
+                        action,
+                        {"success": True, "new_url": page.url},
+                    )
+
+            # Handle <select> dropdown fields
+            for action, selectors in select_profile_actions:
+                sig = self._action_signature(action)
+                if int(action_attempt_counts.get(sig, 0)) >= 1:
+                    continue
+                success = await self._select_first_visible(page, selectors, action["value"])
+                action_attempt_counts[sig] = int(action_attempt_counts.get(sig, 0)) + 1
+                if success:
+                    return (
+                        action,
+                        {"success": True, "new_url": page.url},
+                    )
+
+            # Handle checkbox / toggle fields (e.g. terms & conditions)
+            checkbox_actions = [
+                (
+                    {
+                        "action_type": "check",
+                        "target": "auth_signup_terms_checkbox",
+                        "value": "",
+                    },
+                    [
+                        'input[type="checkbox"][name*="term" i]',
+                        'input[type="checkbox"][name*="agree" i]',
+                        'input[type="checkbox"][name*="accept" i]',
+                        'input[type="checkbox"][name*="consent" i]',
+                        'input[type="checkbox"][name*="policy" i]',
+                        'input[type="checkbox"][id*="term" i]',
+                        'input[type="checkbox"][id*="agree" i]',
+                        '[role="checkbox"][aria-label*="term" i]',
+                        '[role="checkbox"][aria-label*="agree" i]',
+                        '[role="switch"][aria-label*="term" i]',
+                        '[role="switch"][aria-label*="agree" i]',
+                        # Generic: any visible unchecked checkbox on a signup form
+                        'input[type="checkbox"]',
+                    ],
+                ),
+            ]
+
+            for action, selectors in checkbox_actions:
+                sig = self._action_signature(action)
+                if int(action_attempt_counts.get(sig, 0)) >= 1:
+                    continue
+                success = await self._check_first_visible(page, selectors, should_check=True)
+                action_attempt_counts[sig] = int(action_attempt_counts.get(sig, 0)) + 1
+                if success:
+                    return (
+                        action,
+                        {"success": True, "new_url": page.url},
+                    )
+
+            # ── CATCH-ALL: scan ALL visible empty inputs and fill them ──
+            # Collect indices of fields we already tried in previous steps
+            _remaining_prefix = "auth_signup_remaining_field_"
+            _tried_indices: set = set()
+            for _k in action_attempt_counts:
+                if _remaining_prefix in _k:
+                    try:
+                        _idx_part = _k.split(_remaining_prefix)[-1].split(":")[0]
+                        _tried_indices.add(int(_idx_part))
+                    except (ValueError, IndexError):
+                        pass
+            if len(_tried_indices) < 15:
+                filled_result = await self._fill_any_empty_field(
+                    page, generated_user, skip_indices=_tried_indices,
+                )
+                if filled_result:
+                    field_idx, field_hint, field_value = filled_result
+                    remaining_action = {
+                        "action_type": "type",
+                        "target": f"{_remaining_prefix}{field_idx}",
+                        "value": field_value,
+                    }
+                    action_attempt_counts[
+                        self._action_signature(remaining_action)
+                    ] = 1
+                    print(f"[AUTH-SEQ] catch-all filled: [{field_idx}] {field_hint}={field_value!r}", flush=True)
+                    return (
+                        remaining_action,
+                        {"success": True, "new_url": page.url},
+                    )
+
         submit_action = {"action_type": "click", "target": "auth_submit_button", "value": ""}
+        submit_sig = self._action_signature(submit_action)
+        submit_attempts = int(action_attempt_counts.get(submit_sig, 0))
+        submit_selectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Sign up")',
+            'button:has-text("Create account")',
+            'button:has-text("Create Account")',
+            'button:has-text("Register")',
+            'button:has-text("Next")',
+            'button:has-text("Continue")',
+            '[role="button"]:has-text("Sign up")',
+            '[role="button"]:has-text("Create account")',
+            '[role="button"]:has-text("Create Account")',
+            '[role="button"]:has-text("Register")',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+            'button:has-text("Login")',
+            '[role="button"]:has-text("Sign in")',
+            '[role="button"]:has-text("Log in")',
+        ]
         if (
             not auth_form_state.get("submitted")
-            and int(action_attempt_counts.get(self._action_signature(submit_action), 0)) < 3
+            and submit_attempts < 3
         ):
-            clicked = await self._click_first_visible(
-                page,
-                [
-                    'button[type="submit"]',
-                    'input[type="submit"]',
-                    'button:has-text("Sign in")',
-                    'button:has-text("Log in")',
-                    'button:has-text("Login")',
-                    '[role="button"]:has-text("Sign in")',
-                    '[role="button"]:has-text("Log in")',
-                ],
-            )
+            print(f"[AUTH-SEQ] attempting submit on url={page.url!r}", flush=True)
+            # Trigger React-compatible events on all fields so controlled
+            # components recognise the values and re-validate the form.
+            await self._trigger_react_events(page)
+            import asyncio as _aio
+            await _aio.sleep(0.5)
+
+            # Diagnose what might be blocking the submit button
+            try:
+                diag = await page.evaluate("""() => {
+                    const result = {};
+                    // Check for visible error/validation messages
+                    const errEls = document.querySelectorAll(
+                        '[class*="error" i], [class*="invalid" i], [class*="danger" i], ' +
+                        '[role="alert"], .text-red-500, .text-destructive'
+                    );
+                    result.errors = [...errEls]
+                        .filter(el => el.offsetParent !== null && el.textContent.trim())
+                        .map(el => el.textContent.trim().substring(0, 100))
+                        .slice(0, 5);
+                    // Check for any unchecked custom toggles/checkboxes
+                    const toggles = document.querySelectorAll(
+                        '[role="checkbox"]:not([aria-checked="true"]), ' +
+                        '[role="switch"]:not([aria-checked="true"]), ' +
+                        'button[aria-checked="false"], ' +
+                        '[data-state="unchecked"]'
+                    );
+                    result.uncheckedToggles = [...toggles]
+                        .filter(el => el.offsetParent !== null)
+                        .map(el => ({
+                            tag: el.tagName,
+                            text: (el.textContent || el.ariaLabel || '').trim().substring(0, 80),
+                            classes: el.className.substring(0, 100)
+                        }))
+                        .slice(0, 5);
+                    // Check submit button state
+                    const btns = document.querySelectorAll('button');
+                    for (const btn of btns) {
+                        const t = btn.textContent.toLowerCase().trim();
+                        if (t.includes('create') || t.includes('sign up') || t.includes('register')) {
+                            result.submitBtn = {
+                                text: btn.textContent.trim(),
+                                disabled: btn.disabled,
+                                ariaDisabled: btn.getAttribute('aria-disabled'),
+                                classes: btn.className.substring(0, 100)
+                            };
+                            break;
+                        }
+                    }
+                    // Audit every form field
+                    const fields = document.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea'
+                    );
+                    result.fieldAudit = [...fields].map(el => ({
+                        tag: el.tagName,
+                        type: el.type || '',
+                        name: el.name || '',
+                        id: (el.id || '').substring(0, 30),
+                        value: (el.value || '').substring(0, 40),
+                        valid: el.checkValidity ? el.checkValidity() : null,
+                        validationMsg: el.validationMessage || '',
+                        required: el.required,
+                        checked: el.type === 'checkbox' ? el.checked : undefined,
+                        visible: el.offsetParent !== null
+                    })).filter(f => f.visible);
+                    // Check for reCAPTCHA
+                    result.hasCaptcha = !!(
+                        document.querySelector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"]')
+                    );
+                    return result;
+                }""")
+                print(f"[AUTH-SEQ] pre-submit diagnostics: {diag}", flush=True)
+                # Print field audit separately for readability
+                if diag.get("fieldAudit"):
+                    for f in diag["fieldAudit"]:
+                        print(f"[FIELD-AUDIT] {f['tag']} type={f['type']} name={f['name']!r} val={f['value']!r} valid={f['valid']} msg={f['validationMsg']!r} req={f['required']} checked={f.get('checked')}", flush=True)
+
+                # If there are unchecked toggles, try to click them
+                if diag.get("uncheckedToggles"):
+                    for toggle_info in diag["uncheckedToggles"]:
+                        for sel in [
+                            '[role="checkbox"]:not([aria-checked="true"])',
+                            '[role="switch"]:not([aria-checked="true"])',
+                            'button[aria-checked="false"]',
+                            '[data-state="unchecked"]',
+                        ]:
+                            try:
+                                loc = page.locator(sel).first
+                                if await loc.count() > 0 and await loc.is_visible():
+                                    await loc.click(timeout=3000)
+                                    print(f"[AUTH-SEQ] clicked unchecked toggle: {sel}", flush=True)
+                                    await _aio.sleep(0.5)
+                                    break
+                            except Exception:
+                                continue
+                    # Re-trigger React events after clicking toggles
+                    await self._trigger_react_events(page)
+                    await _aio.sleep(0.5)
+            except Exception as e:
+                print(f"[AUTH-SEQ] diagnostics error: {e}", flush=True)
+
+            clicked = await self._click_first_visible(page, submit_selectors)
+            if not clicked:
+                # Scroll to bottom and try again — button may be below fold and/or
+                # form validation needs a moment to enable it
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await _aio.sleep(1.0)
+                except Exception:
+                    pass
+                clicked = await self._click_first_visible(page, submit_selectors)
+            if not clicked:
+                # Last resort: find a disabled submit-like button, force-enable it
+                # and click.  Some React forms keep the button disabled until ALL
+                # client-side validations pass; our fill may satisfy the server but
+                # not the client form state.
+                for sel in submit_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            disabled = await loc.is_disabled()
+                            if disabled:
+                                print(f"[AUTH-SEQ] force-enabling disabled submit button: {sel!r}", flush=True)
+                                await loc.evaluate("el => { el.disabled = false; el.style.opacity = '1'; el.style.cursor = 'pointer'; }")
+                                await _aio.sleep(0.3)
+                                await loc.scroll_into_view_if_needed(timeout=2000)
+                                url_before = page.url
+                                await loc.click(timeout=5000)
+                                await _aio.sleep(1.0)
+                                # If URL didn't change, try dispatching
+                                # React form submit directly via the form element
+                                if page.url == url_before:
+                                    try:
+                                        await page.evaluate("""() => {
+                                            const form = document.querySelector('form');
+                                            if (form) {
+                                                // Try requestSubmit (fires submit event + validation)
+                                                if (form.requestSubmit) {
+                                                    form.requestSubmit();
+                                                } else {
+                                                    form.dispatchEvent(new Event('submit', {bubbles:true, cancelable:true}));
+                                                }
+                                            }
+                                        }""")
+                                        print("[AUTH-SEQ] dispatched form.requestSubmit()", flush=True)
+                                        await _aio.sleep(2.0)
+                                    except Exception:
+                                        pass
+                                clicked = True
+                                break
+                    except Exception:
+                        continue
+            # Always count the attempt to prevent infinite retry when button isn't found
+            action_attempt_counts[submit_sig] = submit_attempts + 1
             if clicked:
                 try:
                     await page.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
+                print(f"[AUTH-SEQ] submit clicked, url_after={page.url!r}", flush=True)
                 return (
                     submit_action,
                     {"success": True, "new_url": page.url},
                 )
 
+        print(f"[AUTH-SEQ] exhausted deterministic options, yielding to LLM", flush=True)
         return None
 
     async def _fill_first_visible(self, page: Any, selectors: List[str], value: str) -> bool:
-        """Fill first visible matching input selector."""
+        """Fill first visible matching input — auto-detects field type and uses the right interaction."""
         for selector in selectors:
             try:
                 locator = page.locator(selector).first
-                if await locator.count() > 0 and await locator.is_visible() and await locator.is_enabled():
+                if await locator.count() == 0 or not await locator.is_visible() or not await locator.is_enabled():
+                    continue
+
+                # Scroll into view before interacting (field may be below the fold)
+                try:
+                    await locator.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+
+                # Detect actual field type to choose the correct interaction
+                tag = (await locator.evaluate("el => el.tagName.toLowerCase()")).strip()
+                input_type = ((await locator.get_attribute("type")) or "text").lower().strip()
+                role = ((await locator.get_attribute("role")) or "").lower().strip()
+
+                # ── <select> dropdown ──
+                if tag == "select":
+                    return await self._select_first_option_locator(locator, value)
+
+                # ── checkbox / toggle ──
+                if input_type == "checkbox" or role in ("switch", "checkbox"):
+                    return await self._check_locator(locator, should_check=True)
+
+                # ── radio ──
+                if input_type == "radio":
+                    return await self._check_locator(locator, should_check=True)
+
+                # ── date / time / datetime-local / month / week ──
+                if input_type in ("date", "datetime-local", "month", "week", "time"):
                     try:
-                        current = await locator.input_value(timeout=1200)
-                        if current != value:
-                            await locator.fill(value, timeout=5000)
-                    except Exception:
                         await locator.fill(value, timeout=5000)
+                    except Exception:
+                        # Some browsers don't allow fill on date inputs
+                        await locator.evaluate(
+                            "(el, v) => { el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                            value,
+                        )
+                    return True
+
+                # ── range / slider ──
+                if input_type == "range":
+                    await locator.fill(value, timeout=5000)
+                    return True
+
+                # ── number ──
+                if input_type == "number":
+                    try:
+                        await locator.fill(value, timeout=5000)
+                    except Exception:
+                        await locator.evaluate(
+                            "(el, v) => { el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                            value,
+                        )
                     try:
                         await locator.press("Tab", timeout=1000)
                     except Exception:
                         pass
                     return True
+
+                # ── textarea / standard text-like inputs ──
+                # Use click + select-all + type sequence to ensure React
+                # controlled components pick up every keystroke.
+                try:
+                    await locator.click(timeout=2000)
+                    # Select all existing text and delete it
+                    await locator.press("Meta+a", timeout=500)
+                    await locator.press("Backspace", timeout=500)
+                except Exception:
+                    pass
+                try:
+                    await locator.type(value, timeout=10000)
+                except Exception:
+                    # Fallback to fill if type fails
+                    await locator.fill(value, timeout=5000)
+                try:
+                    await locator.press("Tab", timeout=1000)
+                except Exception:
+                    pass
+                return True
             except Exception:
                 continue
         return False
+
+    async def _select_first_option_locator(self, locator: Any, value: str) -> bool:
+        """Select an option from a <select> element by value, label, or index."""
+        try:
+            await locator.select_option(value=value, timeout=5000)
+            return True
+        except Exception:
+            pass
+        try:
+            await locator.select_option(label=value, timeout=5000)
+            return True
+        except Exception:
+            pass
+        try:
+            # Select the first non-empty option
+            await locator.select_option(index=1, timeout=5000)
+            return True
+        except Exception:
+            return False
+
+    async def _select_first_visible(self, page: Any, selectors: List[str], value: str = "") -> bool:
+        """Select an option from the first visible <select> or custom dropdown."""
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                tag = (await locator.evaluate("el => el.tagName.toLowerCase()")).strip()
+                if tag == "select":
+                    return await self._select_first_option_locator(locator, value)
+                # For custom dropdowns (combobox role), click to open
+                await locator.click(timeout=3000)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _check_locator(self, locator: Any, should_check: bool = True) -> bool:
+        """Check or uncheck a checkbox / radio / toggle element."""
+        try:
+            is_checked = await locator.is_checked()
+            if should_check and not is_checked:
+                await locator.check(timeout=5000)
+            elif not should_check and is_checked:
+                await locator.uncheck(timeout=5000)
+            return True
+        except Exception:
+            # Fallback: just click it
+            try:
+                await locator.click(timeout=3000)
+                return True
+            except Exception:
+                return False
+
+    async def _check_first_visible(self, page: Any, selectors: List[str], should_check: bool = True) -> bool:
+        """Check/uncheck the first visible checkbox, radio, or toggle."""
+        for selector in selectors:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() == 0 or not await locator.is_visible():
+                    continue
+                return await self._check_locator(locator, should_check)
+            except Exception:
+                continue
+        return False
+
+    async def _fill_any_empty_field(
+        self, page: Any, generated_user: Dict[str, str],
+        skip_indices: Optional[set] = None,
+    ) -> Optional[Tuple[int, str, str]]:
+        """Scan ALL visible empty form fields and fill the first one found.
+
+        Returns (field_index, field_hint, value_filled) or None if nothing to fill.
+        Skips fields at indices in skip_indices (already attempted).
+        """
+        if skip_indices is None:
+            skip_indices = set()
+        try:
+            all_inputs = page.locator(
+                'input:visible:not([type="hidden"]):not([type="submit"])'
+                ':not([type="button"]):not([type="image"]), '
+                'textarea:visible, select:visible'
+            )
+            count = await all_inputs.count()
+            for i in range(count):
+                if i in skip_indices:
+                    continue
+                el = all_inputs.nth(i)
+                try:
+                    if not await el.is_visible() or not await el.is_enabled():
+                        continue
+
+                    # Scroll into view before interacting
+                    try:
+                        await el.scroll_into_view_if_needed(timeout=2000)
+                    except Exception:
+                        pass
+
+                    tag = (await el.evaluate("el => el.tagName.toLowerCase()")).strip()
+                    input_type = ((await el.get_attribute("type")) or "text").lower().strip()
+
+                    # Gather field hints first (needed for skip logic)
+                    name = ((await el.get_attribute("name")) or "").lower()
+                    placeholder = ((await el.get_attribute("placeholder")) or "").lower()
+                    el_id = ((await el.get_attribute("id")) or "").lower()
+                    autocomplete = ((await el.get_attribute("autocomplete")) or "").lower()
+                    label_text = ""
+                    try:
+                        raw_id = await el.get_attribute("id")
+                        if raw_id:
+                            lbl = page.locator(f'label[for="{raw_id}"]')
+                            if await lbl.count() > 0:
+                                label_text = ((await lbl.text_content()) or "").lower()
+                    except Exception:
+                        pass
+
+                    hints = f"{name} {placeholder} {el_id} {label_text} {autocomplete} {input_type}"
+                    field_hint = name or placeholder or el_id or f"field_{i}"
+
+                    print(f"[CATCH-ALL] idx={i} tag={tag} type={input_type} hint={field_hint!r} hints_summary={hints[:80]!r}", flush=True)
+
+                    # Skip email/password fields (already handled by auth sequence)
+                    if any(k in hints for k in ["email", "username"]) and input_type != "date":
+                        continue
+                    # Skip primary password but allow confirm password through
+                    if input_type == "password":
+                        if "confirm" not in hints:
+                            continue
+
+                    # Check if field is already filled
+                    if tag == "select":
+                        sel_idx = await el.evaluate("el => el.selectedIndex")
+                        sel_val = await el.evaluate(
+                            "el => el.options[el.selectedIndex]?.value || ''"
+                        )
+                        if sel_idx and sel_idx > 0 and sel_val:
+                            continue  # already has a non-default selection
+                    elif input_type in ("checkbox", "radio"):
+                        if await el.is_checked():
+                            continue
+                    else:
+                        current_val = ""
+                        is_phone_hint = False
+                        is_just_prefix = False
+                        try:
+                            current_val = await el.input_value(timeout=800)
+                        except Exception:
+                            pass
+                        if current_val:
+                            # Phone fields with just a country code prefix (e.g. "+234", "+1")
+                            # should still be filled with the actual phone number.
+                            import re as _re
+                            is_phone_hint = any(k in hints for k in ["phone", "mobile", "tel", "cell"]) or input_type == "tel"
+                            is_just_prefix = bool(_re.fullmatch(r"\+?\d{1,4}", current_val.strip()))
+                            if is_phone_hint and is_just_prefix:
+                                print(f"[CATCH-ALL] idx={i} phone prefix={current_val!r}, will fill", flush=True)
+                                pass  # fall through to fill
+                            else:
+                                print(f"[CATCH-ALL] idx={i} already filled val={current_val[:30]!r}, skipping", flush=True)
+                                continue
+
+                    # Handle <select> dropdowns
+                    if tag == "select":
+                        try:
+                            # Select the first non-empty option (index 1)
+                            await el.select_option(index=1, timeout=3000)
+                            # Verify it actually changed
+                            new_idx = await el.evaluate("el => el.selectedIndex")
+                            if new_idx and new_idx > 0:
+                                return (i, field_hint, "(selected)")
+                        except Exception:
+                            pass
+                        continue
+
+                    # Handle checkbox / radio / toggle
+                    if input_type in ("checkbox", "radio"):
+                        ok = await self._check_locator(el, should_check=True)
+                        if ok:
+                            return (i, field_hint, "(checked)")
+                        continue
+
+                    role = ((await el.get_attribute("role")) or "").lower()
+                    if role in ("switch", "checkbox"):
+                        ok = await self._check_locator(el, should_check=True)
+                        if ok:
+                            return (i, field_hint, "(checked)")
+                        continue
+
+                    # Choose value based on field hints
+                    value = self._guess_value_from_hints(hints, input_type, generated_user)
+
+                    # If phone field already has a country code prefix,
+                    # keep the prefix and append the phone number.
+                    if is_phone_hint and is_just_prefix and current_val:
+                        value = current_val.strip() + value
+
+                    # Fill the field
+                    is_readonly = False
+                    try:
+                        is_readonly = await el.evaluate("el => el.readOnly || el.hasAttribute('readonly')") or False
+                    except Exception:
+                        pass
+
+                    if input_type in ("date", "datetime-local", "month", "week", "time") or is_readonly:
+                        # Date inputs and readonly fields (e.g. React DatePicker) need
+                        # the native setter approach since fill() may throw.
+                        try:
+                            if not is_readonly:
+                                await el.fill(value, timeout=3000)
+                            else:
+                                raise Exception("readonly")
+                        except Exception:
+                            await el.evaluate(
+                                "(el, v) => {"
+                                "  const desc = Object.getOwnPropertyDescriptor("
+                                "    HTMLInputElement.prototype, 'value');"
+                                "  if (desc && desc.set) { desc.set.call(el, v); }"
+                                "  else { el.value = v; }"
+                                "  el.dispatchEvent(new Event('input',{bubbles:true}));"
+                                "  el.dispatchEvent(new Event('change',{bubbles:true}));"
+                                "}",
+                                value,
+                            )
+                    else:
+                        # Use click + type for React compatibility
+                        try:
+                            await el.click(timeout=2000)
+                            await el.press("Meta+a", timeout=500)
+                            await el.press("Backspace", timeout=500)
+                        except Exception:
+                            pass
+                        try:
+                            await el.type(value, timeout=10000)
+                        except Exception:
+                            await el.fill(value, timeout=3000)
+                        try:
+                            await el.press("Tab", timeout=1000)
+                        except Exception:
+                            pass
+
+                    return (i, field_hint, value)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _guess_value_from_hints(
+        self, hints: str, input_type: str, generated_user: Dict[str, str]
+    ) -> str:
+        """Pick an appropriate value based on field name / placeholder / type hints."""
+        h = hints.lower()
+        if "first" in h and "name" in h:
+            return generated_user["first_name"]
+        if "last" in h and "name" in h:
+            return generated_user["last_name"]
+        if "full" in h and "name" in h:
+            return generated_user["full_name"]
+        if "name" in h and "company" not in h and "business" not in h:
+            return generated_user["full_name"]
+        if any(k in h for k in ["phone", "mobile", "tel", "cell"]) or input_type == "tel":
+            return "3478901234"
+        if any(k in h for k in ["date", "birth", "dob", "calendar"]) or input_type in ("date", "datetime-local"):
+            return "1990-01-15"
+        if any(k in h for k in ["time", "slot"]) or input_type == "time":
+            return "10:30"
+        if input_type == "month":
+            return "1990-01"
+        if input_type == "number" or any(k in h for k in ["age", "quantity", "amount"]):
+            return "25"
+        if any(k in h for k in ["address", "street"]):
+            return "123 Test Street"
+        if any(k in h for k in ["city", "town"]):
+            return "New York"
+        if any(k in h for k in ["state", "province"]):
+            return "NY"
+        if any(k in h for k in ["zip", "postal"]):
+            return "10001"
+        if any(k in h for k in ["country"]):
+            return "United States"
+        if any(k in h for k in ["company", "business", "org"]):
+            return "Test Business"
+        if any(k in h for k in ["url", "website", "link"]) or input_type == "url":
+            return "https://example.com"
+        if any(k in h for k in ["message", "description", "note", "comment", "bio"]):
+            return "This is a test entry."
+        if input_type == "color":
+            return "#3498db"
+        # Default for unknown text fields
+        return "Test Value"
 
     async def _click_first_visible(self, page: Any, selectors: List[str]) -> bool:
         """Click first visible matching selector."""
         for selector in selectors:
             try:
                 locator = page.locator(selector).first
-                if await locator.count() > 0 and await locator.is_visible() and await locator.is_enabled():
+                if await locator.count() > 0 and await locator.is_visible():
+                    # Scroll into view first (button may be below the fold)
+                    try:
+                        await locator.scroll_into_view_if_needed(timeout=2000)
+                    except Exception:
+                        pass
+                    if not await locator.is_enabled():
+                        continue
+                    url_before = page.url
+                    print(f"[CLICK] selector={selector!r} url_before={url_before!r}", flush=True)
                     try:
                         async with page.context.expect_page(timeout=2500) as popup_info:
                             await locator.click(timeout=5000)
@@ -782,7 +2769,16 @@ Which action should be executed next? Consider coverage and discovering new flow
                             pass
                         await popup_page.close()
                     except Exception:
-                        await locator.click(timeout=5000)
+                        # No popup opened. If the click already navigated the tab
+                        # (same-tab redirect), the locator is detached — do NOT retry
+                        # the click. Just check if the URL changed as confirmation.
+                        if page.url != url_before:
+                            print(f"[CLICK] same-tab nav: {url_before!r} → {page.url!r}", flush=True)
+                            return True
+                        try:
+                            await locator.click(timeout=5000)
+                        except Exception:
+                            pass
                     return True
             except Exception:
                 continue
@@ -791,6 +2787,54 @@ Which action should be executed next? Consider coverage and discovering new flow
     def _generate_user_identity(self) -> Dict[str, str]:
         """Generate deterministic-enough test credentials for auth flows."""
         return generate_fallback_identity()
+
+    async def _trigger_react_events(self, page: Any) -> None:
+        """Re-dispatch native input/change events on all filled form fields.
+
+        React controlled components use an internal value tracker.  When
+        Playwright sets a value via ``fill()``, React sometimes ignores
+        it because the native setter wasn't used.  This helper forcibly
+        sets each field's value through the native HTMLInputElement
+        prototype setter and then dispatches ``input`` + ``change``
+        events so React picks up the values and re-validates the form.
+        """
+        try:
+            await page.evaluate("""() => {
+                function triggerReact(el) {
+                    const proto = el.tagName === 'SELECT'
+                        ? HTMLSelectElement.prototype
+                        : el.tagName === 'TEXTAREA'
+                            ? HTMLTextAreaElement.prototype
+                            : HTMLInputElement.prototype;
+                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                    if (!desc || !desc.set || !el.value) return;
+
+                    // Save current value, clear, then re-set to force React change detection
+                    const val = el.value;
+                    desc.set.call(el, '');
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    desc.set.call(el, val);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+
+                    // Also try to trigger React's internal onChange via fiber props
+                    const keys = Object.keys(el);
+                    const reactPropsKey = keys.find(k =>
+                        k.startsWith('__reactProps$') || k.startsWith('__reactEvents$')
+                    );
+                    if (reactPropsKey) {
+                        const props = el[reactPropsKey];
+                        if (props && typeof props.onChange === 'function') {
+                            props.onChange({ target: el, currentTarget: el });
+                        }
+                    }
+                }
+                document.querySelectorAll('input, select, textarea').forEach(triggerReact);
+            }""")
+            print("[AUTH-SEQ] triggered React events on all form fields", flush=True)
+        except Exception as e:
+            print(f"[AUTH-SEQ] React event trigger error: {e}", flush=True)
 
     async def _ensure_dynamic_email_identity(
         self,
@@ -952,11 +2996,44 @@ Which action should be executed next? Consider coverage and discovering new flow
 
         return False
 
-    def _classify_page_context(self, state: GraphState, actions: List[Dict[str, Any]]) -> str:
-        """Classify current page intent for auth-focused heuristics."""
+    def _classify_page_context(
+        self,
+        state: GraphState,
+        actions: List[Dict[str, Any]],
+        vision_analysis: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Classify current page intent for auth-focused heuristics.
+
+        When *vision_analysis* is provided (from ``_vision_analyze_page``), its
+        ``page_type`` is used as the PRIMARY signal — the heuristic text matching
+        only kicks in as fallback when vision is unavailable.
+        """
         title = str(state.get("page_title", "")).lower()
         url = str(state.get("current_url", "")).lower()
+        objective_text = self._primary_objective_text().lower()
+        objective_targets_signup = any(
+            token in objective_text for token in ["sign up", "signup", "register", "create account"]
+        )
+        auth_credentials = self._auth_credentials_available()
 
+        # ── Vision-first classification ──────────────────────────────
+        if vision_analysis and vision_analysis.get("page_type"):
+            vtype = str(vision_analysis["page_type"]).lower().replace(" ", "_")
+            if vtype in ("login", "signin", "sign_in"):
+                ctx = "signin"
+            elif vtype in ("signup", "sign_up", "register", "registration"):
+                ctx = "signup"
+            elif vtype in ("forgot_password", "reset_password", "forgot", "reset"):
+                ctx = "forgot"
+            else:
+                ctx = "general"
+            # Override: if LLM says 'login' but objective targets signup, treat as signup
+            if ctx == "signin" and objective_targets_signup and not auth_credentials:
+                ctx = "signup"
+            print(f"[CLASSIFY] vision-based: page_type={vtype} -> context={ctx}", flush=True)
+            return ctx
+
+        # ── Heuristic fallback (no vision available) ─────────────────
         if ("/dashboard" in url or "/app" in url) and not any(
             auth_path in url for auth_path in ["/login", "/sign-up", "/signup", "/forgot", "/reset"]
         ):
@@ -968,9 +3045,36 @@ Which action should be executed next? Consider coverage and discovering new flow
         )
         corpus = f"{title} {url} {action_text}"
 
-        if any(k in corpus for k in ["forgot", "reset password", "recover"]):
+        # Only classify as "forgot" if the page is truly a forgot-password form.
+        # A mere "forgot password" link on a login/signup page should NOT override
+        # the primary page classification — nearly every auth page has that link.
+        has_forgot_signal = any(k in corpus for k in ["forgot password", "reset password", "recover account", "/forgot", "/reset-password", "/reset_password"])
+        has_auth_signal = any(k in corpus for k in ["sign in", "signin", "log in", "login", "sign up", "signup", "register", "create account"])
+        if has_forgot_signal and not has_auth_signal and not objective_targets_signup:
             return "forgot"
+        if auth_credentials and any(
+            k in corpus
+            for k in [
+                "sign in",
+                "signin",
+                "log in",
+                "login",
+                "sign up",
+                "signup",
+                "register",
+                "create account",
+                "/login",
+                "/signin",
+                "/signup",
+                "/sign-up",
+            ]
+        ):
+            return "signin"
         if any(k in corpus for k in ["sign up", "signup", "register", "create account"]):
+            return "signup"
+        if objective_targets_signup and any(
+            k in corpus for k in ["sign in", "signin", "log in", "login", "/login", "/signin"]
+        ):
             return "signup"
         if any(k in corpus for k in ["sign in", "signin", "log in", "login"]):
             return "signin"
@@ -1018,12 +3122,10 @@ Which action should be executed next? Consider coverage and discovering new flow
                     "create",
                     "new",
                     "add",
-                    "book",
-                    "appointment",
-                    "service",
-                    "staff",
-                    "team",
-                    "calendar",
+                    "edit",
+                    "update",
+                    "manage",
+                    "configure",
                 ]
             ):
                 score += 95
@@ -1052,7 +3154,7 @@ Which action should be executed next? Consider coverage and discovering new flow
         return score
 
     def _value_for_input(self, action: Dict[str, Any], generated_user: Dict[str, str]) -> str:
-        """Generate contextual input values for form fields."""
+        """Generate contextual input values for form fields based on type and context."""
         text_blob = (
             (
                 f"{action.get('text', '')} {action.get('description', '')} {action.get('selector', '')} "
@@ -1060,6 +3162,7 @@ Which action should be executed next? Consider coverage and discovering new flow
                 f"{action.get('role', '')} {action.get('aria_label', '')} {action.get('title', '')}"
             ).lower()
         )
+        input_type = str(action.get("input_type", "")).lower()
 
         if "confirm" in text_blob and "password" in text_blob:
             return generated_user["password"]
@@ -1073,12 +3176,34 @@ Which action should be executed next? Consider coverage and discovering new flow
             return generated_user["last_name"]
         if "name" in text_blob:
             return generated_user["full_name"]
-        if any(k in text_blob for k in ["phone", "mobile", "tel"]):
+        if any(k in text_blob for k in ["phone", "mobile", "tel"]) or input_type == "tel":
             return generated_user["phone"]
-        if any(k in text_blob for k in ["date", "calendar"]) or str(action.get("input_type", "")).lower() == "date":
+        if any(k in text_blob for k in ["date", "calendar", "birth", "dob"]) or input_type in ("date", "datetime-local"):
             return datetime.now().strftime("%Y-%m-%d")
-        if any(k in text_blob for k in ["time", "slot"]):
+        if any(k in text_blob for k in ["time", "slot"]) or input_type == "time":
             return "10:30"
+        if any(k in text_blob for k in ["month"]) or input_type == "month":
+            return datetime.now().strftime("%Y-%m")
+        if input_type == "number" or any(k in text_blob for k in ["quantity", "amount", "count", "age"]):
+            return "25"
+        if input_type == "range":
+            return "50"
+        if any(k in text_blob for k in ["url", "website", "link"]) or input_type == "url":
+            return "https://example.com"
+        if any(k in text_blob for k in ["address", "street"]):
+            return "123 Test Street"
+        if any(k in text_blob for k in ["city", "town"]):
+            return "New York"
+        if any(k in text_blob for k in ["state", "province"]):
+            return "NY"
+        if any(k in text_blob for k in ["zip", "postal"]):
+            return "10001"
+        if any(k in text_blob for k in ["country"]):
+            return "US"
+        if any(k in text_blob for k in ["message", "description", "note", "comment", "bio"]):
+            return "This is a test entry for QA validation."
+        if input_type == "color":
+            return "#3498db"
         return "Sample value"
 
     def _build_heuristic_action(
@@ -1093,6 +3218,13 @@ Which action should be executed next? Consider coverage and discovering new flow
     ) -> Dict[str, Any]:
         """Choose next action without LLM, optimized for auth journey coverage."""
         context = self._classify_page_context(state, actions)
+        objective_text = self._primary_objective_text().lower()
+        objective_targets_signup = any(
+            token in objective_text for token in ["sign up", "signup", "register", "create account"]
+        )
+        auth_credentials = self._auth_credentials_available()
+        current_url = str(state.get("current_url", "")).lower()
+        login_surface = any(token in current_url for token in ["/login", "/signin", "/sign-in", "/auth"])
 
         def text_blob(action: Dict[str, Any]) -> str:
             return (
@@ -1145,12 +3277,8 @@ Which action should be executed next? Consider coverage and discovering new flow
                     "create",
                     "new",
                     "add",
-                    "book",
-                    "appointment",
-                    "service",
-                    "staff",
-                    "team",
-                    "calendar",
+                    "edit",
+                    "update",
                     "schedule",
                     "manage",
                 ]
@@ -1160,11 +3288,41 @@ Which action should be executed next? Consider coverage and discovering new flow
             objective_keywords = self._objective_keywords()
             if objective_keywords and any(token in blob for token in objective_keywords):
                 bonus += 140
+            if self._objective_is_strict() and objective_keywords and not any(
+                token in blob for token in objective_keywords
+            ):
+                bonus -= 220
             return bonus
 
         chosen: Optional[Dict[str, Any]] = None
 
-        if context in {"signin", "signup", "forgot"}:
+        if objective_targets_signup and context == "signin":
+            signup_candidates = [
+                action
+                for action in actions
+                if action.get("type") in {"click", "select"}
+                and any(
+                    token in text_blob(action)
+                    for token in [
+                        "sign up",
+                        "signup",
+                        "register",
+                        "create account",
+                        "get started",
+                        "start free",
+                        "join",
+                        "new here",
+                        "create your",
+                        "free trial",
+                    ]
+                )
+            ]
+            chosen = pick(signup_candidates)
+
+        # Skip auth-form filling when the objective requires signup but we are still on a
+        # signin-classified page — prefer signup navigation discovered above or fall through
+        # to objective-keyword scoring, which naturally ranks signup links higher.
+        if context in {"signin", "signup", "forgot"} and not (objective_targets_signup and context == "signin"):
             if not auth_form_state.get("email_filled"):
                 email_candidates = [
                     action
@@ -1209,9 +3367,14 @@ Which action should be executed next? Consider coverage and discovering new flow
                 ]
                 chosen = pick(forgot_candidates)
 
+        candidate_actions = actions
+        objective_matches = [action for action in actions if self._action_matches_objective(action)]
+        if self._objective_is_strict() and objective_matches and context == "general":
+            candidate_actions = objective_matches
+
         if not chosen:
             scored = sorted(
-                actions,
+                candidate_actions,
                 key=lambda a: self._score_action(a, context, auth_progress)
                 + exploration_bonus(a)
                 - (120 if not_recent(a) is False else 0),
@@ -1232,6 +3395,458 @@ Which action should be executed next? Consider coverage and discovering new flow
             "target": target,
             "value": value,
         }
+
+    def _build_pre_submit_fill_action(
+        self,
+        actions: List[Dict[str, Any]],
+        action_plan: Dict[str, Any],
+        generated_user: Dict[str, str],
+        action_attempt_counts: Dict[str, int],
+    ) -> Optional[Dict[str, Any]]:
+        """If submit is planned while required inputs are present, fill/select required fields first."""
+        if not self._is_submit_like_action(action_plan):
+            return None
+
+        submit_in_dialog: Optional[bool] = None
+        submit_target = str(action_plan.get("target", "")).strip()
+        for action in actions:
+            action_selector = str(action.get("selector", action.get("description", ""))).strip()
+            if action_selector and action_selector == submit_target:
+                submit_in_dialog = bool(action.get("in_dialog", False))
+                break
+
+        def in_scope(action: Dict[str, Any]) -> bool:
+            if submit_in_dialog is None:
+                return True
+            return bool(action.get("in_dialog", False)) == submit_in_dialog
+
+        def within_attempt_limit(candidate: Dict[str, Any], value: str) -> bool:
+            signature = self._action_signature(
+                {
+                    "action_type": candidate.get("type", "click"),
+                    "target": candidate.get("selector", candidate.get("description", "")),
+                    "value": value,
+                }
+            )
+            return int(action_attempt_counts.get(signature, 0)) < 3
+
+        required_selects = [
+            action
+            for action in actions
+            if action.get("type") == "select"
+            and in_scope(action)
+            and (
+                bool(action.get("required"))
+                or str(action.get("aria_invalid", "")).lower() == "true"
+            )
+        ]
+        for field in required_selects:
+            if within_attempt_limit(field, "__webqa_auto__"):
+                return {
+                    "action_type": "select",
+                    "target": field.get("selector", field.get("description", "")),
+                    "value": "__webqa_auto__",
+                    "form_stage": "pre_submit_required_select",
+                }
+
+        required_text_inputs = [
+            action
+            for action in actions
+            if action.get("type") == "type"
+            and in_scope(action)
+            and (
+                bool(action.get("required"))
+                or str(action.get("aria_invalid", "")).lower() == "true"
+            )
+        ]
+        for field in required_text_inputs:
+            value = self._value_for_input(field, generated_user)
+            if within_attempt_limit(field, value):
+                return {
+                    "action_type": "type",
+                    "target": field.get("selector", field.get("description", "")),
+                    "value": value,
+                    "form_stage": "pre_submit_required_fill",
+                }
+
+        likely_required_text_inputs = [
+            action
+            for action in actions
+            if action.get("type") == "type"
+            and in_scope(action)
+            and any(
+                token in self._action_semantic_key(action)
+                for token in [
+                    "name",
+                    "email",
+                    "phone",
+                    "date",
+                    "time",
+                    "address",
+                    "title",
+                    "description",
+                    "message",
+                    "amount",
+                    "quantity",
+                ]
+            )
+        ]
+        for field in likely_required_text_inputs:
+            value = self._value_for_input(field, generated_user)
+            if within_attempt_limit(field, value):
+                return {
+                    "action_type": "type",
+                    "target": field.get("selector", field.get("description", "")),
+                    "value": value,
+                    "form_stage": "pre_submit_likely_required_fill",
+                }
+
+        candidate_selects = [
+            action
+            for action in actions
+            if action.get("type") == "select" and in_scope(action)
+        ]
+        if 0 < len(candidate_selects) <= 3:
+            for field in candidate_selects:
+                if within_attempt_limit(field, "__webqa_auto__"):
+                    return {
+                        "action_type": "select",
+                        "target": field.get("selector", field.get("description", "")),
+                        "value": "__webqa_auto__",
+                        "form_stage": "pre_submit_select_fill",
+                    }
+
+        return None
+
+    def _should_run_validation_exploration(self, objective_text: str) -> bool:
+        """Only run negative validation pass when objective explicitly asks for validation behavior."""
+        text = str(objective_text or "").lower()
+        if not text:
+            return False
+        return any(
+            token in text
+            for token in [
+                "validation",
+                "invalid",
+                "required field",
+                "error state",
+                "form error",
+                "input error",
+                "negative test",
+            ]
+        )
+
+    async def _run_vision_guided_form_step(
+        self,
+        state: GraphState,
+        page: Any,
+        actions: List[Dict[str, Any]],
+        generated_user: Dict[str, str],
+        recent_actions: List[Dict[str, str]],
+        action_attempt_counts: Optional[Dict[str, int]] = None,
+        is_navigation_context: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Use LLM+vision to plan the next action on any page (form, dashboard, wizard).
+
+        Unlike _run_auth_sequence_step (hardcoded selector logic), this method
+        sends a screenshot to Gemini and lets it decide what to fill/click based
+        on what it can actually see.  Works for forms, dropdowns, navigation,
+        and multi-step wizards without needing app-specific selectors.
+        """
+        if not self._has_llm_configured():
+            return None
+
+        try:
+            screenshot_bytes = await page.screenshot(type="png", full_page=False)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            return None
+
+        objective_text = self._primary_objective_text()
+        recent_summaries = [
+            f"{a.get('type')} on {a.get('target', '')}={a.get('value','')!r}"
+            for a in (recent_actions or [])[-5:]
+        ]
+
+        # Read current values from text inputs so Gemini knows what is already filled.
+        current_field_values: List[str] = []
+        for a in actions[:20]:
+            if a.get("type") == "type":
+                selector = a.get("selector", "")
+                try:
+                    val = await page.locator(selector).first.input_value(timeout=800)
+                    if val:
+                        placeholder = a.get("placeholder") or a.get("name") or selector
+                        current_field_values.append(f"{placeholder!r}={val!r}")
+                except Exception:
+                    pass
+
+        # Build a set of normalized signatures that have hit the attempt cap.
+        exhausted_sigs: set = set()
+        if action_attempt_counts:
+            for sig, count in action_attempt_counts.items():
+                if count >= 3:
+                    exhausted_sigs.add(sig)
+
+        action_catalog = []
+        has_dropdown_options = False
+        for a in actions[:20]:
+            selector = a.get("selector", "")
+            norm_selector = re.sub(r"wq-\d+", "wq", selector).lower()
+            role = a.get("role", "")
+            if role == "option":
+                has_dropdown_options = True
+            entry: Dict[str, Any] = {
+                "selector": selector,
+                "type": a.get("type"),
+                "text": a.get("text"),
+                "name": a.get("name"),
+                "placeholder": a.get("placeholder"),
+                "role": role,
+            }
+            # Flag actions that are exhausted so Gemini skips them.
+            if exhausted_sigs and any(norm_selector in sig for sig in exhausted_sigs if norm_selector):
+                entry["NOTE"] = "already_attempted_max_times_try_something_else"
+            action_catalog.append(entry)
+
+        # Build dropdown-open context hint for the prompt.
+        dropdown_hint = ""
+        if has_dropdown_options:
+            option_entries = [e for e in action_catalog if e.get("role") == "option"]
+            option_labels = [e.get("text", "") or e.get("name", "") for e in option_entries]
+            dropdown_hint = (
+                f"\n\nDROPDOWN IS CURRENTLY OPEN — {len(option_entries)} options are visible.\n"
+                f"Option texts: {option_labels}\n"
+                "Click one of the role=option elements by its selector to select it.\n"
+                "Do NOT type into the combobox — click the option element directly.\n"
+            )
+
+        # Infer which sub-goal is currently active for multi-part objectives.
+        visited_urls: List[str] = list(state.get("visited_urls", []))
+        active_subgoal = self._infer_active_subgoal(objective_text, visited_urls)
+        subgoal_changed = active_subgoal != objective_text and active_subgoal
+        visited_summary = ", ".join(
+            str(u).replace("https://", "").split("?")[0] for u in visited_urls[-6:]
+        ) if visited_urls else "none"
+
+        # Build context section based on whether we're navigating or filling forms.
+        if is_navigation_context:
+            task_context = (
+                f"\n\nCONTEXT: You are on the application after completing earlier steps.\n"
+                f"Pages already visited: {visited_summary}\n"
+                + (f"CURRENT ACTIVE GOAL: {active_subgoal}\n" if subgoal_changed else "")
+                + "Since you are on the main application, focus on NAVIGATION:\n"
+                "  - Look for a sidebar menu, top nav, or action buttons.\n"
+                "  - Dismiss any tour / onboarding modal or overlay first (click X, Skip, or Close).\n"
+                "  - Then click the navigation item or button that leads to the current goal.\n"
+                "  - For 'create an appointment', look for: Appointments, Booking, Calendar, New Appointment, Schedule.\n"
+                "  - For 'create a booking', look for: New Booking, Book Now, Add.\n"
+            )
+        elif subgoal_changed:
+            task_context = (
+                f"\n\nCURRENT ACTIVE GOAL: {active_subgoal}\n"
+                f"(Full objective: {objective_text})\n"
+                f"Steps already completed: visited {visited_summary}\n"
+            )
+        else:
+            task_context = ""
+
+        vision_learning_ctx = self._build_learning_context(state)
+        prompt = (
+            "You are a web QA agent. Look at the screenshot of the current page.\n"
+            f"Objective: {objective_text or 'Complete the visible form/flow'}\n"
+            f"Current URL: {state.get('current_url', '')}\n"
+            f"Page title: {state.get('page_title', '')}\n"
+            + task_context
+            + vision_learning_ctx
+            + (f"\nIMPORTANT: These text fields already have values filled in (do NOT re-fill them):\n  {current_field_values}\n" if current_field_values else "")
+            + dropdown_hint
+            + "\nDetermine the single best next action to advance the current goal:\n"
+        )
+
+        if is_navigation_context:
+            prompt += (
+                "  - If a modal, tour, or overlay is blocking the page, dismiss it first.\n"
+                "  - Otherwise click the navigation element that leads to the current goal.\n"
+                "  - If you see a 'New Appointment', 'Create Appointment', 'Schedule', or similar button, click it.\n"
+                "  - Do NOT fill in forms unless you are already on the target page.\n"
+            )
+        else:
+            prompt += (
+                "  - If a text/email/password/number/url/tel field is EMPTY, fill it with 'type' action.\n"
+                "  - If a <select> dropdown is present, use 'select' action with the desired option value.\n"
+                "  - If a combobox/custom-select is CLOSED (role=combobox in catalog), click it to open.\n"
+                "  - If the DROPDOWN IS OPEN (role=option elements appear in catalog), click one option by selector.\n"
+                "  - If a checkbox or toggle needs to be checked (e.g. terms), use 'check' action.\n"
+                "  - If a radio button needs to be selected, use 'check' action on it.\n"
+                "  - For date fields: use 'type' with value in YYYY-MM-DD format.\n"
+                "  - For time fields: use 'type' with value in HH:MM format.\n"
+                "  - If all required fields are filled and options selected, click the submit button.\n"
+            )
+
+        prompt += (
+            "  - IMPORTANT: If an element has NOTE='already_attempted_max_times_try_something_else',\n"
+            "    do NOT try to interact with it again — pick a different element instead.\n"
+            "  - If a modal or dialog is blocking, dismiss it first.\n\n"
+            "Return ONLY valid JSON with keys: action_type, target, value, reasoning.\n"
+            "  action_type: 'click' | 'type' | 'select' | 'check'\n"
+            "  target: CSS selector from the catalog\n"
+            "  value: text to type, option to select, or empty for clicks/checks\n"
+            "  reasoning: one sentence explaining why\n\n"
+            f"Available elements (execution catalog):\n{json.dumps(action_catalog, indent=2)}\n\n"
+            f"Recent actions already performed (do NOT repeat):\n"
+            f"  {recent_summaries}\n"
+            "User identity for form fields — email: "
+            f"{generated_user.get('email', '')}, "
+            f"first_name: {generated_user.get('first_name', '')}, "
+            f"last_name: {generated_user.get('last_name', '')}, "
+            f"phone: {generated_user.get('phone', '')}, "
+            f"password: {generated_user.get('password', '')}, "
+            f"company_name: {generated_user.get('company_name', 'WebQA Labs')}"
+        )
+
+        try:
+            response = await self.llm.ainvoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are a precise web QA automation agent with vision. "
+                            "You receive a screenshot + structured data and return ONE action as JSON. "
+                            "You can handle any web app: SaaS, e-commerce, internal tools, etc. "
+                            "Return JSON only — no markdown fences, no prose."
+                        )
+                    ),
+                    HumanMessage(
+                        content=[
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                            },
+                        ]
+                    ),
+                ]
+            )
+            self._track_llm_usage(state, 900)
+            self._record_llm_turn(state, "tester/vision", prompt, str(response.content))
+            parsed = _parse_llm_json(response.content)
+            # Record the vision agent's reasoning as a learning
+            if isinstance(parsed, dict) and parsed.get("reasoning"):
+                self._record_learning(state, f"Vision: {parsed['reasoning'][:150]}")
+            return parsed
+        except Exception:
+            return None
+
+    async def _build_visual_first_action(
+        self,
+        state: GraphState,
+        page: Any,
+        actions: List[Dict[str, Any]],
+        generated_user: Dict[str, str],
+        auth_progress: Dict[str, bool],
+        auth_form_state: Dict[str, bool],
+        recent_actions: List[Dict[str, str]],
+        action_attempt_counts: Dict[str, int],
+    ) -> Dict[str, Any]:
+        """Choose next action primarily from screenshot understanding when DOM exploration is disabled."""
+        screenshot_b64: Optional[str] = None
+        try:
+            screenshot_bytes = await page.screenshot(type="png", full_page=False)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+        except Exception:
+            screenshot_b64 = None
+
+        objective_text = self._primary_objective_text()
+        action_excerpt = [
+            {
+                "type": action.get("type"),
+                "selector": action.get("selector"),
+                "text": action.get("text"),
+                "name": action.get("name"),
+                "description": action.get("description"),
+            }
+            for action in actions[:12]
+        ]
+
+        prompt = (
+            "DOM exploration is disabled. Use screenshot-first reasoning to infer what the app currently shows, "
+            "what functionality is available, and the next best step. "
+            "Choose an executable action from the provided action list. "
+            "Return strict JSON with keys: action_type, target, value.\n"
+            f"Page title: {state.get('page_title', '')}\n"
+            f"URL: {state.get('current_url', '')}\n"
+            f"Primary objective: {objective_text or 'None'}\n"
+            f"Available actions (execution catalog): {json.dumps(action_excerpt, indent=2)}"
+        )
+
+        try:
+            if screenshot_b64:
+                response = await self.llm.ainvoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                "You are a visual web QA planner. "
+                                "Infer functionality from screenshot and choose one executable next action. "
+                                "Return JSON only."
+                            )
+                        ),
+                        HumanMessage(
+                            content=[
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                                },
+                            ]
+                        ),
+                    ]
+                )
+            else:
+                response = await self.llm.ainvoke(
+                    [
+                        ("system", self.SYSTEM_PROMPT),
+                        ("human", prompt),
+                    ]
+                )
+            self._track_llm_usage(state, 700)
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            self._record_llm_turn(state, "tester/visual", prompt, content)
+            action_plan = json.loads(content)
+
+            action_type = str(action_plan.get("action_type", "click"))
+            target = str(action_plan.get("target", "")).strip()
+            value = str(action_plan.get("value", ""))
+            if not target:
+                raise ValueError("Missing target in visual-first action response")
+
+            if action_type == "type" and not value:
+                matched_action = next(
+                    (
+                        action
+                        for action in actions
+                        if str(action.get("selector", "")).strip() == target
+                        or str(action.get("description", "")).strip() == target
+                    ),
+                    None,
+                )
+                if matched_action:
+                    value = self._value_for_input(matched_action, generated_user)
+
+            return {
+                "action_type": action_type,
+                "target": target,
+                "value": value,
+            }
+        except Exception:
+            return self._build_heuristic_action(
+                state,
+                actions,
+                generated_user,
+                auth_progress,
+                auth_form_state,
+                recent_actions,
+                action_attempt_counts,
+            )
 
     def _pick_navigation_action(
         self,
@@ -1269,13 +3884,12 @@ Which action should be executed next? Consider coverage and discovering new flow
             "back to login",
         ]
         priority_tokens = [
-            "calendar",
-            "service",
-            "booking",
-            "appointment",
-            "staff",
-            "team",
-            "client",
+            "create",
+            "add",
+            "new",
+            "edit",
+            "update",
+            "manage",
             "setting",
             "payment",
             "integration",
@@ -1286,6 +3900,13 @@ Which action should be executed next? Consider coverage and discovering new flow
         objective_keywords = self._objective_keywords()
         if objective_keywords:
             priority_tokens.extend(sorted(objective_keywords)[:30])
+
+        strict_objective = self._objective_is_strict()
+        objective_matches_available = any(
+            self._action_matches_objective(action)
+            for action in actions
+            if action.get("type") in {"click", "select"}
+        )
 
         ranked: List[Tuple[int, Dict[str, Any], str]] = []
         covered_intents = deep_traversal_state.setdefault("covered_intents", set())
@@ -1298,6 +3919,8 @@ Which action should be executed next? Consider coverage and discovering new flow
             if not semantic or semantic in nav_labels_clicked:
                 continue
             if any(token in semantic for token in ignored_tokens):
+                continue
+            if strict_objective and objective_matches_available and not self._action_matches_objective(action):
                 continue
             word_count = len(semantic.split())
             if word_count > 4:
@@ -1323,7 +3946,7 @@ Which action should be executed next? Consider coverage and discovering new flow
                 score += 25
             if word_count <= 2:
                 score += 90
-            if any(k in semantic for k in ["create", "book", "service", "staff", "calendar", "appointment"]):
+            if any(k in semantic for k in ["create", "add", "new", "edit", "update", "manage"]):
                 score += 60
             if any(token in semantic for token in priority_tokens):
                 score += 120
@@ -1363,35 +3986,174 @@ Which action should be executed next? Consider coverage and discovering new flow
 
     def _objective_keywords(self) -> set[str]:
         """Extract lightweight keyword hints from configured objectives."""
-        objective_config = self.config.get("objectives") or {}
-        objective_items = objective_config.get("objectives") if isinstance(objective_config, dict) else None
-        if not objective_items:
+        return self._objective_terms()
+
+    def _objective_intents(self) -> set[str]:
+        """Infer product intents directly from the active objective."""
+        corpus = self._primary_objective_text().lower()
+        intents: set[str] = set()
+        if not corpus:
+            return intents
+
+        for intent, keywords in self.INTENT_KEYWORDS.items():
+            if any(keyword in corpus for keyword in keywords):
+                intents.add(intent)
+        return intents
+
+    def _objective_intents_to_entities(self) -> set[str]:
+        """Derive expected mutation entities directly from objective keywords."""
+        objective_keywords = set(self._objective_keywords())
+        if not objective_keywords:
             return set()
 
-        keywords: set[str] = set()
-        for item in objective_items:
-            if not isinstance(item, dict):
-                continue
+        noise = {
+            "flow",
+            "page",
+            "user",
+            "test",
+            "validate",
+            "verify",
+            "check",
+            "focus",
+            "only",
+            "just",
+            "objective",
+            "directed",
+            "sign",
+            "signup",
+            "register",
+            "signin",
+            "login",
+            "log",
+            "account",
+            "password",
+            "verify",
+            "verification",
+            "forgot",
+            "reset",
+            "create",
+            "new",
+            "add",
+            "update",
+            "edit",
+            "delete",
+        }
+        entities = {
+            self._normalize_entity_token(token)
+            for token in objective_keywords
+            if len(token) >= 4 and token not in noise
+        }
+        return {token for token in entities if token}
 
-            name = str(item.get("name", ""))
-            description = str(item.get("description", ""))
-            required_elements = item.get("required_elements") or []
-            critical_paths = item.get("critical_paths") or []
+    def _objective_completion_reached(self, mutation_assertions: Dict[str, Any]) -> bool:
+        """Check whether objective-required entities have been detected."""
+        required = set(str(value) for value in mutation_assertions.get("required_entities", []))
+        if not required:
+            return True
+        detected = set(str(value) for value in mutation_assertions.get("detected_entities", []))
+        return required.issubset(detected)
 
-            corpus_parts = [name, description]
-            corpus_parts.extend(str(value) for value in required_elements)
-            for path in critical_paths:
-                if isinstance(path, list):
-                    corpus_parts.extend(str(step) for step in path)
+    def _normalize_entity_token(self, token: str) -> str:
+        """Normalize token into a stable singular-style entity identifier."""
+        normalized = re.sub(r"[^a-z0-9_-]", "", str(token).strip().lower())
+        if normalized.endswith("ies") and len(normalized) > 4:
+            normalized = normalized[:-3] + "y"
+        elif normalized.endswith("es") and len(normalized) > 4:
+            normalized = normalized[:-2]
+        elif normalized.endswith("s") and len(normalized) > 3:
+            normalized = normalized[:-1]
+        return normalized
 
-            corpus = " ".join(corpus_parts).lower()
-            for token in re.findall(r"[a-z][a-z0-9_-]{2,}", corpus):
-                normalized = token.replace("_", "-")
-                if normalized in {"flow", "page", "user", "create", "manage", "test"}:
-                    continue
-                keywords.add(normalized)
+    def _action_matches_objective(self, action: Dict[str, Any]) -> bool:
+        """Check whether an available action aligns with the active objective."""
+        blob = " ".join(
+            [
+                str(action.get("text", "")),
+                str(action.get("description", "")),
+                str(action.get("selector", "")),
+                str(action.get("name", "")),
+                str(action.get("id", "")),
+                str(action.get("placeholder", "")),
+                str(action.get("input_type", "")),
+                str(action.get("href", "")),
+                str(action.get("role", "")),
+                str(action.get("aria_label", "")),
+                str(action.get("title", "")),
+            ]
+        ).lower()
 
-        return keywords
+        objective_keywords = self._objective_keywords()
+        if objective_keywords and any(token in blob for token in objective_keywords):
+            return True
+
+        objective_intents = self._objective_intents()
+        if objective_intents and (self._infer_action_intents(action) & objective_intents):
+            return True
+
+        return False
+
+    def _action_plan_matches_objective(self, action_plan: Dict[str, Any]) -> bool:
+        """Check whether a resolved action plan aligns with the active objective."""
+        blob = " ".join(
+            [
+                str(action_plan.get("action_type", "")),
+                str(action_plan.get("target", "")),
+                str(action_plan.get("value", "")),
+                str(action_plan.get("form_stage", "")),
+                str(action_plan.get("nav_label", "")),
+            ]
+        )
+        return self._objective_matches_text(blob)
+
+    def _pick_obstruction_clear_action(self, actions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Dismiss unrelated share/dialog overlays when they block a strict objective flow."""
+        if not self._objective_is_strict() or not self._primary_objective_text():
+            return None
+
+        share_tokens = {
+            "share",
+            "facebook",
+            "twitter",
+            "linkedin",
+            "instagram",
+            "whatsapp",
+            "sms",
+            "mail",
+            "copy link",
+            "open ai",
+        }
+        close_tokens = {"close", "dismiss", "cancel", "not now", "done", "back"}
+
+        share_like_actions = []
+        close_candidates = []
+        for action in actions:
+            blob = " ".join(
+                [
+                    str(action.get("text", "")),
+                    str(action.get("description", "")),
+                    str(action.get("selector", "")),
+                    str(action.get("aria_label", "")),
+                    str(action.get("title", "")),
+                ]
+            ).lower()
+            if any(token in blob for token in share_tokens):
+                share_like_actions.append(action)
+            if action.get("type") in {"click", "select"} and (
+                any(token in blob for token in close_tokens)
+                or re.search(r"\b[x×]\b", blob)
+            ):
+                close_candidates.append(action)
+
+        if len(share_like_actions) >= 2 and close_candidates:
+            close_action = close_candidates[0]
+            return {
+                "action_type": close_action.get("type", "click"),
+                "target": close_action.get("selector", close_action.get("description", "")),
+                "value": self._action_semantic_key(close_action) or "dismiss blocking dialog",
+                "nav_label": "dismiss blocking dialog",
+            }
+
+        return None
 
     def _url_key(self, url: str) -> str:
         """Create stable URL key for per-page traversal bookkeeping."""
@@ -1479,6 +4241,8 @@ Which action should be executed next? Consider coverage and discovering new flow
                 "valid_done": False,
                 "filled_targets": [],
                 "clicked_targets": [],
+                "modal_submit_failures": 0,
+                "validation_retry_round": 0,
             },
         )
         stage = int(state_entry.get("stage", 0))
@@ -1495,7 +4259,6 @@ Which action should be executed next? Consider coverage and discovering new flow
                     "save",
                     "create",
                     "add",
-                    "book",
                     "continue",
                     "next",
                     "register",
@@ -1528,6 +4291,13 @@ Which action should be executed next? Consider coverage and discovering new flow
         submit_value = self._action_semantic_key(submit)
 
         if in_modal_form:
+            modal_failures = int(state_entry.get("modal_submit_failures", 0))
+            if modal_failures >= 4:
+                state_entry["stage"] = 5
+                state_entry["active"] = False
+                return None
+
+            has_validation_error = self._has_validation_error_signal(actions)
             filled_targets = set(str(value) for value in state_entry.get("filled_targets", []))
             clicked_targets = set(str(value) for value in state_entry.get("clicked_targets", []))
 
@@ -1539,7 +4309,7 @@ Which action should be executed next? Consider coverage and discovering new flow
 
             for field in modal_select_inputs:
                 target = str(field.get("selector", field.get("description", "")))
-                if target in filled_targets:
+                if target in filled_targets and not has_validation_error:
                     continue
                 if within_attempt_limit(field, "__webqa_auto__"):
                     return {
@@ -1591,15 +4361,12 @@ Which action should be executed next? Consider coverage and discovering new flow
                     token in semantic
                     for token in [
                         "select",
-                        "service",
-                        "customer",
-                        "client",
-                        "staff",
-                        "team",
+                        "choose",
+                        "option",
+                        "item",
+                        "pick",
                         "date",
                         "time",
-                        "slot",
-                        "calendar",
                         "duration",
                     ]
                 ):
@@ -1607,7 +4374,7 @@ Which action should be executed next? Consider coverage and discovering new flow
 
             for action in modal_click_candidates:
                 target = str(action.get("selector", action.get("description", "")))
-                if target in clicked_targets:
+                if target in clicked_targets and not has_validation_error:
                     continue
                 semantic = self._action_semantic_key(action)
                 if within_attempt_limit(action, semantic):
@@ -1629,7 +4396,7 @@ Which action should be executed next? Consider coverage and discovering new flow
 
             for field in required_modal_inputs:
                 target = str(field.get("selector", field.get("description", "")))
-                if target in filled_targets:
+                if target in filled_targets and not has_validation_error:
                     continue
                 value = self._value_for_input(field, generated_user)
                 if within_attempt_limit(field, value):
@@ -1703,6 +4470,36 @@ Which action should be executed next? Consider coverage and discovering new flow
 
         return None
 
+    def _has_validation_error_signal(self, actions: List[Dict[str, Any]]) -> bool:
+        """Detect whether UI hints indicate unresolved form validation errors."""
+        tokens = {
+            "required",
+            "is required",
+            "required field",
+            "invalid",
+            "validation",
+            "must be",
+            "please enter",
+            "please select",
+            "error",
+        }
+        for action in actions:
+            blob = " ".join(
+                [
+                    str(action.get("text", "")),
+                    str(action.get("description", "")),
+                    str(action.get("name", "")),
+                    str(action.get("aria_label", "")),
+                    str(action.get("title", "")),
+                    str(action.get("selector", "")),
+                ]
+            ).lower()
+            if any(token in blob for token in tokens):
+                return True
+            if bool(action.get("required")) or str(action.get("aria_invalid", "")).lower() == "true":
+                return True
+        return False
+
     def _invalid_value_for_input(self, action: Dict[str, Any]) -> str:
         """Generate intentionally invalid input to trigger browser/app validation."""
         text_blob = (
@@ -1760,9 +4557,18 @@ Which action should be executed next? Consider coverage and discovering new flow
             entry["clicked_targets"] = sorted(clicked_targets)
             return
         if form_stage == "modal_submit":
-            entry["valid_done"] = bool(result.get("success"))
+            submit_success = bool(result.get("success"))
+            entry["valid_done"] = submit_success
             entry["active"] = False
-            entry["stage"] = 5 if entry["valid_done"] else max(stage, 1)
+            if submit_success:
+                entry["stage"] = 5
+                entry["modal_submit_failures"] = 0
+            else:
+                entry["modal_submit_failures"] = int(entry.get("modal_submit_failures", 0)) + 1
+                entry["validation_retry_round"] = int(entry.get("validation_retry_round", 0)) + 1
+                entry["filled_targets"] = []
+                entry["clicked_targets"] = []
+                entry["stage"] = 1
             return
         if stage == 1 and form_stage == "wrong_validation_input":
             entry["stage"] = 2
@@ -1775,9 +4581,15 @@ Which action should be executed next? Consider coverage and discovering new flow
             entry["stage"] = 4
             return
         if stage == 4 and form_stage == "valid_submit":
-            entry["valid_done"] = bool(result.get("success"))
+            submit_success = bool(result.get("success"))
+            entry["valid_done"] = submit_success
             entry["active"] = False
-            entry["stage"] = 5
+            if submit_success:
+                entry["stage"] = 5
+                entry["modal_submit_failures"] = 0
+            else:
+                entry["validation_retry_round"] = int(entry.get("validation_retry_round", 0)) + 1
+                entry["stage"] = 1
             return
 
     def _update_auth_form_state(
@@ -1788,6 +4600,12 @@ Which action should be executed next? Consider coverage and discovering new flow
     ) -> None:
         """Track auth form progression to avoid retyping same field in a loop."""
         text_blob = f"{action_plan.get('target', '')} {action_plan.get('action_type', '')}".lower()
+        if "auth_switch_to_signup" in text_blob or "auth_switch_to_signin" in text_blob:
+            auth_form_state["email_filled"] = False
+            auth_form_state["password_filled"] = False
+            auth_form_state["submitted"] = False
+            auth_form_state["submit_attempts"] = 0
+            return
         if action_plan.get("action_type") == "type":
             if any(k in text_blob for k in ["email", "username", "user", "login"]):
                 auth_form_state["email_filled"] = True
@@ -1815,10 +4633,43 @@ Which action should be executed next? Consider coverage and discovering new flow
             {
                 "type": str(action_plan.get("action_type", "")),
                 "target": str(action_plan.get("target", "")),
+                "value": str(action_plan.get("value", "")),
             }
         )
         if len(recent_actions) > 12:
             del recent_actions[:-12]
+
+    def _infer_active_subgoal(self, objective_text: str, visited_urls: List[str]) -> str:
+        """For multi-part objectives infer which sub-goal is currently active.
+
+        Splits the objective on "and", "then", or commas, then checks visited
+        URLs to determine which parts are done.  Returns the first incomplete
+        part, or the original text if everything is done / not determinable.
+        """
+        text = (objective_text or "").lower().strip()
+        if not text:
+            return text
+        # Split on connectors
+        parts = [p.strip() for p in re.split(r"\band\b|\bthen\b|,\s*", text) if p.strip()]
+        if len(parts) <= 1:
+            return objective_text
+
+        visited = " ".join(str(u) for u in (visited_urls or [])).lower()
+
+        def _is_done(part: str) -> bool:
+            if any(k in part for k in ["sign up", "signup", "register", "create account"]):
+                return "/dashboard" in visited or "/create-business" in visited
+            if any(k in part for k in ["create a business", "create business", "business"]):
+                return "/dashboard" in visited
+            if any(k in part for k in ["appointment", "booking", "schedule"]):
+                return any(k in visited for k in ["/appointment", "/booking", "/schedule", "/calendar"])
+            return False
+
+        for part in parts:
+            if not _is_done(part):
+                return part.strip()
+        # All parts appear done — return original to avoid confusing the LLM
+        return objective_text
 
     def _action_signature(self, action_plan: Dict[str, Any]) -> str:
         """Create a stable signature used to cap repeated attempts."""
@@ -1855,13 +4706,6 @@ Which action should be executed next? Consider coverage and discovering new flow
         for intent, keywords in self.INTENT_KEYWORDS.items():
             if any(keyword in corpus for keyword in keywords):
                 intents.add(intent)
-
-        if "team" in corpus or "member" in corpus or "personnel" in corpus:
-            intents.add("staff")
-        if "schedule" in corpus or "availability" in corpus:
-            intents.add("calendar")
-        if "book" in corpus or "reserve" in corpus:
-            intents.add("appointments")
 
         return intents
 
@@ -1909,7 +4753,24 @@ Which action should be executed next? Consider coverage and discovering new flow
         return mutation_logs
 
     def _detect_mutation_entities(self, mutation_logs: List[Dict[str, Any]]) -> set[str]:
-        """Classify mutation logs into business entities we care about."""
+        """Classify mutation logs into dynamic entities inferred from objective + API paths."""
+        objective_entities = self._objective_intents_to_entities()
+        noise_tokens = {
+            "api",
+            "graphql",
+            "mutation",
+            "query",
+            "create",
+            "update",
+            "delete",
+            "list",
+            "bulk",
+            "submit",
+            "save",
+            "v1",
+            "v2",
+            "v3",
+        }
         detected: set[str] = set()
         for log in mutation_logs:
             corpus = " ".join(
@@ -1918,12 +4779,19 @@ Which action should be executed next? Consider coverage and discovering new flow
                     str(log.get("post_data", "")),
                 ]
             ).lower()
-            if any(token in corpus for token in ["service", "services", "offering", "catalog"]):
-                detected.add("service")
-            if any(token in corpus for token in ["staff", "team-member", "employee", "provider"]):
-                detected.add("staff")
-            if any(token in corpus for token in ["appointment", "booking", "bookings", "schedule", "timeslot", "slot"]):
-                detected.add("appointment")
+
+            candidates = {
+                self._normalize_entity_token(token)
+                for token in re.findall(r"[a-z][a-z0-9_-]{2,}", corpus)
+            }
+            candidates = {token for token in candidates if token and token not in noise_tokens}
+
+            if objective_entities:
+                matched = {entity for entity in objective_entities if entity in candidates or entity in corpus}
+                detected.update(matched)
+                continue
+
+            detected.update({token for token in candidates if len(token) >= 4})
         return detected
 
     def _is_submit_like_action(self, action_plan: Dict[str, Any]) -> bool:
@@ -1940,7 +4808,7 @@ Which action should be executed next? Consider coverage and discovering new flow
                 str(action_plan.get("form_stage", "")),
             ]
         ).lower()
-        return any(token in corpus for token in ["submit", "save", "create", "add", "book", "confirm"])
+        return any(token in corpus for token in ["submit", "save", "create", "add", "confirm"])
 
     def _expected_entities_for_submit(
         self,
@@ -1958,13 +4826,10 @@ Which action should be executed next? Consider coverage and discovering new flow
             ]
         ).lower()
 
-        expected: set[str] = set()
-        if any(token in corpus for token in ["service", "offering", "catalog"]):
-            expected.add("service")
-        if any(token in corpus for token in ["staff", "team", "employee", "provider", "member"]):
-            expected.add("staff")
-        if any(token in corpus for token in ["appointment", "booking", "calendar", "schedule", "slot"]):
-            expected.add("appointment")
+        objective_entities = self._objective_intents_to_entities()
+        expected = {entity for entity in objective_entities if entity and entity in corpus}
+        if not expected and objective_entities:
+            expected = set(objective_entities)
 
         if expected:
             return expected
@@ -2037,15 +4902,35 @@ Should we continue testing this flow or mark it complete?""",
             try:
                 response = await self.llm.ainvoke(messages)
                 self._track_llm_usage(state, 500)
+                self._record_llm_turn(
+                    state, "validator",
+                    f"Validate: {last_step.action} on {last_step.target} [{last_step.status}]",
+                    str(response.content),
+                )
 
-                validation = json.loads(response.content)
+                validation = _parse_llm_json(response.content)
+
+                # Record validator's findings as learning
+                if isinstance(validation, dict):
+                    if validation.get("is_critical_error"):
+                        self._record_learning(state, f"Validator found CRITICAL error after {last_step.action} on {last_step.target}")
+                    elif validation.get("should_complete_flow"):
+                        self._record_learning(state, f"Validator: flow completed successfully after {last_step.action}")
 
                 # Update flow status based on validation
                 if state["current_flow"]:
                     if validation.get("should_complete_flow"):
-                        state["current_flow"].status = "completed"
-                        state["current_flow"].end_url = state["current_url"]
-                        state["current_flow"] = None
+                        objective_text = self._primary_objective_text().lower()
+                        current_url = str(state.get("current_url", "")).lower()
+                        if any(
+                            token in objective_text
+                            for token in ["sign up", "signup", "register", "create account"]
+                        ) and any(token in current_url for token in ["/login", "/signin", "/sign-in"]):
+                            pass
+                        else:
+                            state["current_flow"].status = "completed"
+                            state["current_flow"].end_url = state["current_url"]
+                            state["current_flow"] = None
                     elif has_errors and validation.get("is_critical_error"):
                         state["current_flow"].status = "failed"
                         state["current_flow"] = None

@@ -1,6 +1,16 @@
 # WebQA-Plus Dockerfile
 # Multi-stage build for production-ready image
 
+# ── Stage 1: Build React frontend ──────────────────────────────────────────
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci --ignore-scripts
+COPY frontend/ ./
+RUN npm run build
+
+# ── Stage 2: Build Python dependencies ─────────────────────────────────────
 FROM python:3.12-slim as builder
 
 # Install system dependencies
@@ -77,6 +87,9 @@ WORKDIR /app
 COPY src/ ./src/
 COPY config.yaml.example ./
 
+# Copy built React frontend so FastAPI can serve it in production mode
+COPY --from=frontend-builder /frontend/dist ./frontend/dist
+
 # Create reports directory
 RUN mkdir -p /app/reports
 
@@ -92,12 +105,12 @@ RUN playwright install chromium
 RUN useradd -m -u 1000 webqa && chown -R webqa:webqa /app
 USER webqa
 
-# Expose port (for potential web interface)
+# Expose port (Cloud Run uses PORT env var, defaults to 8080)
 EXPOSE 8080
 
-# Default command
+# Default: launch the web server in production mode
 ENTRYPOINT ["webqa-plus"]
-CMD ["--help"]
+CMD ["web", "--host", "0.0.0.0", "--port", "8080", "--no-reload"]
 
 # Labels
 LABEL maintainer="WebQA-Plus Team"
