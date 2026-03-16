@@ -4,12 +4,11 @@
 # Required substitutions (set in Cloud Build trigger or pass via --substitutions):
 #   _SERVICE_NAME  : Cloud Run service name (default: webqa-plus)
 #   _REGION        : Deployment region         (default: us-central1)
-#   _PROJECT_ID    : GCP project ID
 
 substitutions:
   _SERVICE_NAME: webqa-plus
   _REGION: us-central1
-  _IMAGE: gcr.io/$PROJECT_ID/${_SERVICE_NAME}
+  _IMAGE: gcr.io/${PROJECT_ID}/${_SERVICE_NAME}
 
 steps:
   # 1. Build the container image
