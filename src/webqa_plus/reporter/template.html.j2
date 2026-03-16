@@ -1,278 +1,849 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ title }}</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ title }}</title>
+  <style>
+    :root {
+      --blue:   #2563eb;
+      --green:  #16a34a;
+      --red:    #dc2626;
+      --amber:  #d97706;
+      --gray50: #f8fafc;
+      --gray100:#f1f5f9;
+      --gray200:#e2e8f0;
+      --gray400:#94a3b8;
+      --gray700:#334155;
+      --gray900:#0f172a;
+      --radius: 8px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--gray700);
+      background: #fff;
+    }
+    .page { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+    .page-break { page-break-after: always; }
+    section { margin-bottom: 48px; }
+
+    /* Header */
+    .header {
+      background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+      color: #fff;
+      padding: 36px 44px;
+      border-radius: var(--radius);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 32px;
+      gap: 24px;
+    }
+    .header-brand { display: flex; align-items: center; gap: 12px; }
+    .header-icon { font-size: 38px; }
+    .header-title { font-size: 24px; font-weight: 700; }
+    .header-subtitle { font-size: 12px; opacity: 0.82; margin-top: 2px; }
+    .header-meta { text-align: right; font-size: 12px; opacity: 0.88; line-height: 1.9; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 2px 9px; border-radius: 999px;
+             font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; }
+    .badge-pass { background: #dcfce7; color: #15803d; }
+    .badge-fail { background: #fee2e2; color: #b91c1c; }
+    .badge-warn { background: #fef3c7; color: #92400e; }
+    .badge-info { background: #dbeafe; color: #1d4ed8; }
+
+    /* KPI grid */
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+                gap: 14px; margin-bottom: 28px; }
+    .kpi { background: var(--gray50); border: 1px solid var(--gray200); border-radius: var(--radius);
+           padding: 18px 14px; text-align: center; }
+    .kpi-value { font-size: 26px; font-weight: 700; color: var(--blue); line-height: 1; margin-bottom: 5px; }
+    .kpi-value.green { color: var(--green); }
+    .kpi-value.red   { color: var(--red); }
+    .kpi-label { font-size: 10px; color: var(--gray400); text-transform: uppercase; letter-spacing: .5px; }
+
+    /* Coverage bar */
+    .coverage-wrap { margin-bottom: 20px; }
+    .coverage-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 7px; }
+    .coverage-label { font-weight: 600; font-size: 13px; }
+    .coverage-pct { font-size: 19px; font-weight: 700; color: var(--blue); }
+    .coverage-track { background: var(--gray200); border-radius: 6px; height: 13px; overflow: hidden; }
+    .coverage-fill { height: 100%; border-radius: 6px;
+                     background: linear-gradient(90deg, var(--blue), #10b981); }
+
+    /* Section headings */
+    h2 { font-size: 17px; font-weight: 700; color: var(--gray900);
+         border-left: 4px solid var(--blue); padding-left: 11px; margin-bottom: 18px; }
+    h3 { font-size: 13px; font-weight: 600; color: var(--gray700); margin-bottom: 8px; }
+
+    /* Objective card */
+    .objective-card { border: 1px solid var(--gray200); border-radius: var(--radius);
+                      padding: 18px 22px; background: var(--gray50); margin-bottom: 14px; }
+    .objective-card .obj-text { font-size: 13px; font-weight: 600; margin-bottom: 10px; }
+    .objective-entity { display: inline-block; background: var(--gray100); border: 1px solid var(--gray200);
+                        border-radius: 4px; font-size: 11px; padding: 2px 8px; margin: 2px 3px 2px 0; }
+    .objective-entity.met  { background: #dcfce7; border-color: #86efac; color: #15803d; }
+    .objective-entity.miss { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; }
+
+    /* URL list */
+    .url-list { list-style: none; }
+    .url-list li { padding: 7px 11px; border-left: 3px solid var(--blue); background: var(--gray50);
+                   margin-bottom: 5px; border-radius: 0 var(--radius) var(--radius) 0;
+                   font-size: 12px; font-family: monospace; word-break: break-all; }
+
+    /* Timeline */
+    .timeline { position: relative; padding-left: 26px; }
+    .timeline::before { content: ''; position: absolute; left: 9px; top: 0; bottom: 0;
+                        width: 2px; background: var(--gray200); }
+    .tl-step { position: relative; margin-bottom: 4px; break-inside: avoid; }
+    .tl-dot { position: absolute; left: -22px; top: 10px; width: 12px; height: 12px;
+              border-radius: 50%; background: var(--gray400); border: 2px solid #fff;
+              box-shadow: 0 0 0 1px var(--gray200); }
+    .tl-dot.pass { background: var(--green); }
+    .tl-dot.fail { background: var(--red); }
+    .tl-row { display: flex; align-items: center; gap: 9px; padding: 7px 11px;
+              border: 1px solid var(--gray200); border-radius: var(--radius);
+              background: #fff; font-size: 12px; }
+    .tl-row:hover { background: var(--gray50); }
+    .tl-num  { width: 26px; font-weight: 700; color: var(--gray400); text-align: right; flex-shrink: 0; }
+    .tl-icon { width: 18px; text-align: center; flex-shrink: 0; }
+    .tl-action { width: 58px; font-weight: 600; color: var(--blue); flex-shrink: 0; }
+    .tl-target { flex: 1; font-family: monospace; font-size: 11px; color: var(--gray700); word-break: break-all; }
+    .tl-dur    { width: 52px; text-align: right; font-size: 11px; color: var(--gray400); flex-shrink: 0; }
+    .tl-status { width: 60px; text-align: right; flex-shrink: 0; }
+    .tl-error  { font-size: 11px; color: var(--red); padding: 3px 11px 5px calc(26px + 11px); font-style: italic; }
+
+    /* Visual evidence */
+    .evidence-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+                     gap: 14px; margin-top: 10px; }
+    .evidence-card { border: 1px solid var(--gray200); border-radius: var(--radius); overflow: hidden; }
+    .evidence-card.fail { border-color: #fca5a5; }
+    .evidence-label { font-size: 11px; font-weight: 600; background: var(--gray50); padding: 5px 9px;
+                      color: var(--gray700); border-bottom: 1px solid var(--gray200); }
+    .evidence-card.fail .evidence-label { background: #fee2e2; color: var(--red); }
+    .evidence-card img { width: 100%; display: block; object-fit: contain; max-height: 260px; }
+    .ocr-note { font-size: 11px; padding: 7px 9px; background: #fefce8;
+                border-top: 1px solid var(--gray200); color: #713f12; }
+
+    /* Flow cards */
+    .flow-card { border: 1px solid var(--gray200); border-radius: var(--radius);
+                 padding: 14px 18px; margin-bottom: 10px; background: var(--gray50); }
+    .flow-header { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; }
+    .flow-name { font-weight: 700; font-size: 13px; }
+    .flow-meta { font-size: 12px; color: var(--gray400); }
+    .flow-url  { font-family: monospace; font-size: 11px; color: var(--gray700); word-break: break-all; }
+
+    /* Errors */
+    .error-item { background: #fff5f5; border: 1px solid #fecaca; border-left: 4px solid var(--red);
+                  border-radius: var(--radius); padding: 10px 14px; margin-bottom: 9px;
+                  font-size: 12px; font-family: monospace; white-space: pre-wrap; word-break: break-word; }
+
+    /* Tables */
+    table { width: 100%; border-collapse: collapse; margin-bottom: 22px; font-size: 12px; }
+    th { background: var(--gray100); padding: 9px 11px; text-align: left; font-weight: 600;
+         border-bottom: 2px solid var(--gray200); color: var(--gray700); }
+    td { padding: 8px 11px; border-bottom: 1px solid var(--gray200); vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    tr:nth-child(even) td { background: var(--gray50); }
+
+    /* Misc */
+    .mono  { font-family: monospace; font-size: 11px; }
+    .muted { color: var(--gray400); font-size: 11px; }
+    pre   { background: var(--gray100); border: 1px solid var(--gray200); border-radius: var(--radius);
+            padding: 12px; font-size: 11px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+    code  { font-family: monospace; font-size: 11px; background: var(--gray100);
+            padding: 1px 5px; border-radius: 3px; }
+    details summary { cursor: pointer; font-size: 12px; color: var(--blue); user-select: none; }
+
+    .footer { text-align: center; font-size: 11px; color: var(--gray400);
+              border-top: 1px solid var(--gray200); padding-top: 22px; margin-top: 44px; }
+
+    /* ── Executive Summary ──────────────────────────────────────── */
+    .verdict-box { border: 2px solid; border-radius: var(--radius); padding: 20px 26px;
+                   margin-bottom: 28px; display: flex; align-items: flex-start; gap: 20px; }
+    .verdict-box.pass { border-color: var(--green); background: #f0fdf4; }
+    .verdict-box.fail { border-color: var(--red);   background: #fff5f5; }
+    .verdict-box.warn { border-color: var(--amber);  background: #fffbeb; }
+    .verdict-icon { font-size: 42px; line-height: 1; flex-shrink: 0; }
+    .verdict-body { flex: 1; }
+    .verdict-title { font-size: 20px; font-weight: 800; margin-bottom: 4px; }
+    .verdict-title.pass { color: var(--green); }
+    .verdict-title.fail { color: var(--red); }
+    .verdict-title.warn { color: var(--amber); }
+    .verdict-summary { font-size: 13px; color: var(--gray700); line-height: 1.7; }
+    .verdict-stats { flex-shrink: 0; text-align: right; font-size: 12px;
+                     color: var(--gray700); line-height: 1.9; }
+
+    /* ── Bug Cards ──────────────────────────────────────────────── */
+    .bug-card { border: 1px solid var(--gray200); border-radius: var(--radius);
+                margin-bottom: 22px; overflow: hidden; }
+    .bug-card.CRITICAL { border-left: 5px solid var(--red); }
+    .bug-card.HIGH     { border-left: 5px solid #f97316; }
+    .bug-card.MEDIUM   { border-left: 5px solid var(--amber); }
+    .bug-card.LOW      { border-left: 5px solid var(--blue); }
+    .bug-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+                  background: var(--gray50); border-bottom: 1px solid var(--gray200); flex-wrap: wrap; }
+    .bug-id    { font-family: monospace; font-size: 11px; font-weight: 700;
+                 color: var(--gray400); letter-spacing: .5px; }
+    .bug-severity { padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+    .bug-severity.CRITICAL { background: #fee2e2; color: #991b1b; }
+    .bug-severity.HIGH     { background: #ffedd5; color: #c2410c; }
+    .bug-severity.MEDIUM   { background: #fef3c7; color: #92400e; }
+    .bug-severity.LOW      { background: #dbeafe; color: #1d4ed8; }
+    .bug-title { font-weight: 700; font-size: 13px; flex: 1; color: var(--gray900); }
+    .bug-body  { padding: 14px 16px; }
+    .bug-meta-row { display: flex; gap: 20px; margin-bottom: 12px; flex-wrap: wrap; }
+    .bug-meta-item label { display: block; font-size: 10px; font-weight: 700;
+                           text-transform: uppercase; letter-spacing: .5px; color: var(--gray400); }
+    .bug-meta-item span  { font-size: 12px; font-family: monospace; color: var(--gray700); }
+    .bug-error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 4px;
+                 padding: 9px 13px; font-family: monospace; font-size: 12px; color: #b91c1c;
+                 margin-bottom: 12px; white-space: pre-wrap; word-break: break-word; }
+    .bug-sub-title { font-size: 11px; font-weight: 700; text-transform: uppercase;
+                     letter-spacing: .5px; color: var(--gray400); margin: 10px 0 6px; }
+    .repro-track { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+    .repro-step  { display: inline-flex; align-items: center; gap: 5px;
+                   background: var(--gray100); border: 1px solid var(--gray200);
+                   border-radius: 4px; padding: 2px 8px; font-size: 11px; font-family: monospace; }
+    .repro-arr   { color: var(--gray400); font-size: 13px; }
+    .repro-fail  { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; font-weight: 700; }
+    .clog-error { font-size: 11px; font-family: monospace; padding: 3px 8px;
+                  border-radius: 3px; margin-bottom: 3px; color: #991b1b;
+                  background: #fff5f5; word-break: break-all; }
+    .clog-warn  { font-size: 11px; font-family: monospace; padding: 3px 8px;
+                  border-radius: 3px; margin-bottom: 3px; color: #92400e;
+                  background: #fffbeb; word-break: break-all; }
+    .net-fail-row { display: flex; align-items: baseline; gap: 8px; font-size: 11px;
+                    font-family: monospace; padding: 3px 8px; border-radius: 3px;
+                    margin-bottom: 3px; background: #fff5f5; flex-wrap: wrap; }
+    .net-status { font-weight: 800; color: var(--red); min-width: 38px; }
+    .net-method { color: var(--blue); min-width: 44px; }
+    .net-url    { color: var(--gray700); word-break: break-all; flex: 1; }
+
+    /* ── Aggregated network/console tables ───────────────────────── */
+    .log-table { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-bottom: 6px; }
+    .log-table th { background: var(--gray100); padding: 7px 10px; text-align: left;
+                    font-weight: 600; border-bottom: 2px solid var(--gray200); color: var(--gray700); }
+    .log-table td { padding: 6px 10px; border-bottom: 1px solid var(--gray100);
+                    vertical-align: top; word-break: break-word; }
+    .log-table tr:last-child td { border-bottom: none; }
+    .log-table tr.lvl-error td { background: #fff8f8; }
+    .log-table tr.lvl-warn  td { background: #fffdf0; }
+    .lvl-pill { display: inline-block; padding: 1px 7px; border-radius: 999px;
+                font-size: 10px; font-weight: 700; text-transform: uppercase; }
+    .lvl-error { background: #fee2e2; color: #991b1b; }
+    .lvl-warn  { background: #fef3c7; color: #92400e; }
+    .st-4xx { color: #f97316; font-weight: 700; }
+    .st-5xx { color: var(--red); font-weight: 700; }
+
+    /* ── Performance ─────────────────────────────────────────────── */
+    .perf-row { display: flex; align-items: center; gap: 12px; padding: 7px 11px;
+                border-bottom: 1px solid var(--gray100); font-size: 12px; }
+    .perf-row:last-child { border-bottom: none; }
+    .perf-num { width: 26px; font-weight: 700; color: var(--gray400); text-align: right; flex-shrink: 0; }
+    .perf-action { width: 60px; font-weight: 600; color: var(--blue); flex-shrink: 0; font-size: 11px; }
+    .perf-target { flex: 1; font-family: monospace; font-size: 11px; color: var(--gray700);
+                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+    .perf-bar-wrap { width: 160px; background: var(--gray200); border-radius: 4px;
+                     height: 8px; overflow: hidden; flex-shrink: 0; }
+    .perf-bar-fill { height: 100%; border-radius: 4px; background: var(--blue); }
+    .perf-bar-fill.slow { background: var(--red); }
+    .perf-ms { width: 72px; text-align: right; font-weight: 700; color: var(--gray700); flex-shrink: 0; }
+    .perf-ms.slow { color: var(--red); }
+    .tl-badges { display: flex; gap: 4px; margin-left: auto; flex-shrink: 0; }
+    .tl-badge-warn { font-size: 10px; background: #fef3c7; color: #92400e;
+                     border: 1px solid #fde68a; border-radius: 3px; padding: 1px 5px; font-weight: 600; }
+    .tl-badge-err  { font-size: 10px; background: #fee2e2; color: #991b1b;
+                     border: 1px solid #fca5a5; border-radius: 3px; padding: 1px 5px; font-weight: 600; }
+    .tl-badge-net  { font-size: 10px; background: #ffedd5; color: #c2410c;
+                     border: 1px solid #fed7aa; border-radius: 3px; padding: 1px 5px; font-weight: 600; }
+    .tl-badge-slow { font-size: 10px; background: #f3f4f6; color: var(--gray700);
+                     border: 1px solid var(--gray200); border-radius: 3px; padding: 1px 5px; font-weight: 600; }
+  </style>
 </head>
 <body>
-    {# Cover Page #}
-    <div class="cover">
-        <div style="font-size: 80px; margin-bottom: 30px;">🧪</div>
-        <h1>WebQA-Plus</h1>
-        <div class="subtitle">Autonomous AI Web QA Test Report</div>
-        
-        <div class="metadata">
-            <p><strong>Generated:</strong> {{ generated_at | format_datetime }}</p>
-            <p><strong>Test Duration:</strong> {{ "%.1f" | format(duration) }} seconds</p>
-            <p><strong>Target URL:</strong> {{ config.testing.url }}</p>
-            <p><strong>Mode:</strong> {{ config.testing.mode | upper }}</p>
-        </div>
-    </div>
+<div class="page">
 
-    {# Executive Summary #}
-    <h1>Executive Summary</h1>
-    
-    <div class="metrics-grid">
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.coverage_pct | round(1) }}%</div>
-            <div class="metric-label">Coverage</div>
+  {# ── HEADER ─────────────────────────────────────────────────── #}
+  <div class="header">
+    <div class="header-brand">
+      <div class="header-icon">🧪</div>
+      <div>
+        <div class="header-title">WebQA-Plus Report</div>
+        <div class="header-subtitle">
+          Autonomous AI Web QA
+          {% if config.testing is defined %} · {{ config.testing.mode | upper }}{% endif %}
         </div>
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.successful_steps }}</div>
-            <div class="metric-label">Passed</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.failed_steps }}</div>
-            <div class="metric-label">Failed</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.visited_urls }}</div>
-            <div class="metric-label">Pages</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.completed_flows }}</div>
-            <div class="metric-label">Flows</div>
-        </div>
-        <div class="metric-card">
-            <div class="metric-value">{{ metrics.llm_calls }}</div>
-            <div class="metric-label">LLM Calls</div>
-        </div>
+      </div>
     </div>
+    <div class="header-meta">
+      {% if config.testing is defined %}
+        <div><strong>Target:</strong> {{ config.testing.url }}</div>
+      {% endif %}
+      <div><strong>Generated:</strong> {{ generated_at | format_datetime }}</div>
+      <div><strong>Duration:</strong> {{ "%.1f" | format(duration) }}s</div>
+      <div style="margin-top:8px;">
+        {% if metrics.failed_steps == 0 and metrics.total_steps > 0 %}
+          <span class="badge badge-pass">✓ All Passed</span>
+        {% elif metrics.successful_steps == 0 %}
+          <span class="badge badge-fail">✗ All Failed</span>
+        {% else %}
+          <span class="badge badge-warn">⚠ Partial</span>
+        {% endif %}
+      </div>
+    </div>
+  </div>
 
-    <h2>Coverage Overview</h2>
-    
-    <div class="coverage-bar">
+  {# ── KPIs ────────────────────────────────────────────────────── #}
+  <section>
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.coverage_pct | round(1) }}%</div>
+        <div class="kpi-label">Coverage</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value green">{{ metrics.successful_steps }}</div>
+        <div class="kpi-label">Passed</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value {% if metrics.failed_steps > 0 %}red{% endif %}">{{ metrics.failed_steps }}</div>
+        <div class="kpi-label">Failed</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.total_steps }}</div>
+        <div class="kpi-label">Total Steps</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.visited_urls }}</div>
+        <div class="kpi-label">Pages</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.completed_flows }}/{{ metrics.total_flows }}</div>
+        <div class="kpi-label">Flows</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.llm_calls }}</div>
+        <div class="kpi-label">LLM Calls</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ metrics.estimated_cost }}</div>
+        <div class="kpi-label">Est. Cost</div>
+      </div>
+    </div>
+    <div class="coverage-wrap">
+      <div class="coverage-header">
+        <span class="coverage-label">Step Success Rate</span>
+        <span class="coverage-pct">{{ metrics.success_rate }}</span>
+      </div>
+      <div class="coverage-track">
         <div class="coverage-fill" style="width: {{ metrics.coverage_pct }}%"></div>
+      </div>
     </div>
-    <p>Overall test coverage: {{ metrics.coverage_pct | round(1) }}%</p>
-
-    <h2>Test Results</h2>
-    
-    <table>
-        <thead>
-            <tr>
-                <th>Metric</th>
-                <th>Value</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr>
-                <td>Total Steps</td>
-                <td>{{ metrics.total_steps }}</td>
-            </tr>
-            <tr>
-                <td>Successful Steps</td>
-                <td><span class="status-success">{{ metrics.successful_steps }}</span></td>
-            </tr>
-            <tr>
-                <td>Failed Steps</td>
-                <td><span class="status-failed">{{ metrics.failed_steps }}</span></td>
-            </tr>
-            <tr>
-                <td>Success Rate</td>
-                <td>{{ metrics.success_rate }}</td>
-            </tr>
-            <tr>
-                <td>Flows Discovered</td>
-                <td>{{ metrics.total_flows }}</td>
-            </tr>
-            <tr>
-                <td>Flows Completed</td>
-                <td>{{ metrics.completed_flows }}</td>
-            </tr>
-            <tr>
-                <td>Estimated Cost</td>
-                <td>{{ metrics.estimated_cost }}</td>
-            </tr>
-        </tbody>
-    </table>
-
-    {# User Flows #}
-    <div class="page-break"></div>
-    <h1>Discovered User Flows</h1>
-
-    {% if flows %}
-        {% for flow in flows %}
-            <h2>{{ flow.name }}</h2>
-            <p><strong>Description:</strong> {{ flow.description or 'No description' }}</p>
-            <p><strong>Status:</strong> {{ flow.status }}</p>
-            <p><strong>Start URL:</strong> {{ flow.start_url }}</p>
-            {% if flow.end_url %}
-                <p><strong>End URL:</strong> {{ flow.end_url }}</p>
-            {% endif %}
-
-            {% if flow.steps %}
-                <h3>Flow Steps</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>Agent</th>
-                            <th>Action</th>
-                            <th>Target</th>
-                            <th>Status</th>
-                            <th>Duration</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for step in flow.steps %}
-                            <tr>
-                                <td>{{ step.step_number }}</td>
-                                <td>{{ step.agent }}</td>
-                                <td>{{ step.action }}</td>
-                                <td>{{ step.target or '-' }}</td>
-                                <td>
-                                    {% if step.status == 'success' %}
-                                        <span class="status-success">✓ Success</span>
-                                    {% elif step.status == 'failed' %}
-                                        <span class="status-failed">✗ Failed</span>
-                                    {% else %}
-                                        <span class="status-pending">⏳ {{ step.status }}</span>
-                                    {% endif %}
-                                </td>
-                                <td>{{ step.duration_ms or '-' }} ms</td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            {% endif %}
-
-            {% if not loop.last %}
-                <div class="page-break"></div>
-            {% endif %}
-        {% endfor %}
+  </section>
+  {# ── EXECUTIVE SUMMARY ───────────────────────────────────────── #}
+  <section>
+    {% if metrics.failed_steps == 0 and metrics.total_steps > 0 %}
+      {% set verdict_cls = "pass" %}
+      {% set verdict_icon = "✅" %}
+      {% set verdict_label = "ALL TESTS PASSED" %}
+      {% set verdict_desc = "No failures detected. All " ~ metrics.total_steps ~ " test steps completed successfully across " ~ metrics.total_flows ~ " user flow(s)." %}
+    {% elif metrics.successful_steps == 0 %}
+      {% set verdict_cls = "fail" %}
+      {% set verdict_icon = "🚨" %}
+      {% set verdict_label = "ALL TESTS FAILED" %}
+      {% set verdict_desc = "Every tested step encountered an error. The application may be unreachable or fundamentally broken. Immediate investigation required." %}
+    {% elif metrics.failed_steps > 0 %}
+      {% set verdict_cls = "fail" %}
+      {% set verdict_icon = "❌" %}
+      {% set verdict_label = "TESTS FAILED — " ~ metrics.failed_steps ~ " ISSUE(S) FOUND" %}
+      {% set verdict_desc = metrics.failed_steps ~ " out of " ~ metrics.total_steps ~ " steps failed (" ~ metrics.success_rate ~ " pass rate). See the Bug Report below for root-cause details and reproduction steps." %}
     {% else %}
-        <p>No flows discovered during testing.</p>
+      {% set verdict_cls = "warn" %}
+      {% set verdict_icon = "⚠️" %}
+      {% set verdict_label = "NO STEPS EXECUTED" %}
+      {% set verdict_desc = "The test run completed without executing any steps. Check your configuration and target URL." %}
     {% endif %}
 
-    {# Test Details #}
-    <div class="page-break"></div>
-    <h1>Test Step Details</h1>
+    <div class="verdict-box {{ verdict_cls }}">
+      <div class="verdict-icon">{{ verdict_icon }}</div>
+      <div class="verdict-body">
+        <div class="verdict-title {{ verdict_cls }}">{{ verdict_label }}</div>
+        <div class="verdict-summary">{{ verdict_desc }}</div>
+        {% if failures %}
+          <div class="verdict-summary" style="margin-top:8px;">
+            <strong>Blocking issues:</strong>
+            {% for f in failures[:3] %}
+              <span class="badge badge-fail" style="margin-right:4px;">{{ f.bug_id }}</span>
+              {{ f.action }} on <code>{{ f.target | truncate(40, True) }}</code>{% if not loop.last %} &bull; {% endif %}
+            {% endfor %}
+            {% if failures | length > 3 %}&nbsp;+ {{ failures | length - 3 }} more{% endif %}
+          </div>
+        {% endif %}
+        {% if all_network_failures %}
+          <div class="verdict-summary" style="margin-top:6px;">
+            <strong>Network errors:</strong> {{ all_network_failures | length }} unique failed request(s) detected ({{ all_network_failures | selectattr('status', 'ge', 500) | list | length }} server errors, {{ all_network_failures | selectattr('status', 'lt', 500) | list | length }} client errors).
+          </div>
+        {% endif %}
+      </div>
+      <div class="verdict-stats">
+        {% if config.testing is defined %}
+          <div><strong>Target:</strong> {{ config.testing.url }}</div>
+          <div><strong>Mode:</strong> {{ config.testing.mode | upper }}</div>
+        {% endif %}
+        <div><strong>Duration:</strong> {{ "%.1f" | format(duration) }}s</div>
+        <div><strong>Steps:</strong> <span style="color:var(--green)">{{ metrics.successful_steps }}✓</span> / <span style="color:var(--red)">{{ metrics.failed_steps }}✗</span> of {{ metrics.total_steps }}</div>
+        {% if perf.avg_ms > 0 %}<div><strong>Avg step:</strong> {{ perf.avg_ms }} ms</div>{% endif %}
+      </div>
+    </div>
+  </section>
+  {# ── OBJECTIVES ──────────────────────────────────────────────── #}
+  {% if objectives %}
+  <section>
+    <h2>Test Objectives</h2>
+    {% for obj in objectives %}
+      <div class="objective-card">
+        <div class="obj-text">
+          {% if loop.first %}<span class="badge badge-info" style="margin-right:8px;">Primary</span>{% endif %}
+          {{ obj.description if obj is mapping else obj }}
+        </div>
+        {% if mutation_assertions and loop.first %}
+          <div>
+            <span class="muted">Required entities:&nbsp;</span>
+            {% for entity in mutation_assertions.get('required_entities', []) %}
+              {% if entity in mutation_assertions.get('detected_entities', []) %}
+                <span class="objective-entity met">✓ {{ entity }}</span>
+              {% else %}
+                <span class="objective-entity miss">✗ {{ entity }}</span>
+              {% endif %}
+            {% else %}
+              <span class="muted">No entity assertions configured.</span>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </section>
+  {% endif %}
 
-    {% if test_results %}
-        <table>
-            <thead>
-                <tr>
-                    <th>Step</th>
-                    <th>Agent</th>
-                    <th>Action</th>
-                    <th>Status</th>
-                    <th>Error</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for result in test_results %}
-                    <tr>
-                        <td>{{ result.step_number }}</td>
-                        <td>{{ result.agent }}</td>
-                        <td>{{ result.action }} {% if result.target %}on {{ result.target }}{% endif %}</td>
-                        <td>
-                            {% if result.status == 'success' %}
-                                <span class="status-success">✓</span>
-                            {% elif result.status == 'failed' %}
-                                <span class="status-failed">✗</span>
-                            {% else %}
-                                {{ result.status }}
-                            {% endif %}
-                        </td>
-                        <td>{{ result.error_message or '-' }}</td>
-                    </tr>
+  {# ── PAGES VISITED ───────────────────────────────────────────── #}
+  {% if visited_urls %}
+  <section>
+    <h2>Pages Visited ({{ visited_urls | length }})</h2>
+    <ul class="url-list">
+      {% for url in visited_urls %}<li>{{ url }}</li>{% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {# ── FLOWS ───────────────────────────────────────────────────── #}
+  {% if flows %}
+  <section>
+    <h2>User Flows ({{ flows | length }})</h2>
+    {% for flow in flows %}
+      <div class="flow-card">
+        <div class="flow-header">
+          <span class="flow-name">{{ flow.name or 'Unnamed Flow' }}</span>
+          {% if flow.status == 'completed' %}<span class="badge badge-pass">Completed</span>
+          {% elif flow.status == 'failed' %}<span class="badge badge-fail">Failed</span>
+          {% else %}<span class="badge badge-warn">{{ flow.status }}</span>{% endif %}
+        </div>
+        {% if flow.description %}<div class="flow-meta">{{ flow.description }}</div>{% endif %}
+        <div class="flow-url">
+          <strong>Start:</strong> {{ flow.start_url or '—' }}
+          {% if flow.end_url %} → <strong>End:</strong> {{ flow.end_url }}{% endif %}
+        </div>
+        {% if flow.steps %}
+          <details style="margin-top:10px;">
+            <summary>{{ flow.steps | length }} steps</summary>
+            <table style="margin-top:8px;">
+              <thead><tr><th>#</th><th>Agent</th><th>Action</th><th>Target</th><th>Status</th><th>ms</th></tr></thead>
+              <tbody>
+                {% for step in flow.steps %}
+                  <tr>
+                    <td>{{ step.step_number }}</td>
+                    <td><span class="badge badge-info">{{ step.agent }}</span></td>
+                    <td class="mono">{{ step.action }}</td>
+                    <td class="mono">{{ step.target or '—' }}</td>
+                    <td>{% if step.status == 'success' %}✅{% elif step.status == 'failed' %}❌{% else %}⏸ {{ step.status }}{% endif %}</td>
+                    <td class="muted">{{ step.duration_ms or '—' }}</td>
+                  </tr>
                 {% endfor %}
-            </tbody>
-        </table>
+              </tbody>
+            </table>
+          </details>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </section>
+  {% endif %}
 
-        <h2>Visual Evidence</h2>
-        {% for result in test_results %}
-            {% if result.visuals %}
-                <div class="step-detail">
-                    <p>
-                        <strong>Step {{ result.step_number }}</strong> — {{ result.action }}
-                        {% if result.target %} on {{ result.target }}{% endif %}
-                    </p>
+  {# ── BUG REPORT ──────────────────────────────────────────────── #}
+  {% if failures %}
+  <div class="page-break"></div>
+  <section>
+    <h2>Bug Report — {{ failures | length }} Issue(s) Found</h2>
+    {% for bug in failures %}
+      <div class="bug-card {{ bug.severity }}">
+        <div class="bug-header">
+          <span class="bug-id">{{ bug.bug_id }}</span>
+          <span class="bug-severity {{ bug.severity }}">{{ bug.severity }}</span>
+          <span class="bug-title">Step {{ bug.step_number }}: {{ bug.action | upper }} failed on <code>{{ bug.target | truncate(60, True) }}</code></span>
+          <span class="badge badge-info">{{ bug.agent }}</span>
+        </div>
+        <div class="bug-body">
 
-                    {% if result.visuals.ocr %}
-                        <p>
-                            <strong>OCR Fallback:</strong>
-                            {{ result.visuals.ocr.summary or 'No summary provided' }}
-                            (confidence: {{ result.visuals.ocr.confidence or 'unknown' }})
-                        </p>
-                        {% if result.visuals.ocr.evidence_keywords %}
-                            <p><strong>OCR Evidence:</strong> {{ result.visuals.ocr.evidence_keywords | join(', ') }}</p>
-                        {% endif %}
-                    {% endif %}
+          {# Error message #}
+          <div class="bug-error">{{ bug.error_message }}</div>
 
-                    <div class="metrics-grid">
-                        {% if result.visuals.before_full %}
-                            <div class="metric-card" style="min-width: 260px; text-align: left;">
-                                <div class="metric-label">Before (Full)</div>
-                                <img class="screenshot" src="{{ result.visuals.before_full }}" alt="Step {{ result.step_number }} before full" />
-                            </div>
-                        {% endif %}
-                        {% if result.visuals.before_crop %}
-                            <div class="metric-card" style="min-width: 260px; text-align: left;">
-                                <div class="metric-label">Before (Target Crop)</div>
-                                <img class="screenshot" src="{{ result.visuals.before_crop }}" alt="Step {{ result.step_number }} before crop" />
-                            </div>
-                        {% endif %}
-                        {% if result.visuals.after_full %}
-                            <div class="metric-card" style="min-width: 260px; text-align: left;">
-                                <div class="metric-label">After (Full)</div>
-                                <img class="screenshot" src="{{ result.visuals.after_full }}" alt="Step {{ result.step_number }} after full" />
-                            </div>
-                        {% endif %}
-                        {% if result.visuals.after_crop %}
-                            <div class="metric-card" style="min-width: 260px; text-align: left;">
-                                <div class="metric-label">After (Target Crop)</div>
-                                <img class="screenshot" src="{{ result.visuals.after_crop }}" alt="Step {{ result.step_number }} after crop" />
-                            </div>
-                        {% endif %}
-                        {% if result.visuals.annotated_failure %}
-                            <div class="metric-card" style="min-width: 260px; text-align: left; border-color: #ef4444;">
-                                <div class="metric-label" style="color: #ef4444;">Annotated Failure</div>
-                                <img class="screenshot" src="{{ result.visuals.annotated_failure }}" alt="Step {{ result.step_number }} annotated failure" />
-                            </div>
-                        {% endif %}
-                    </div>
-                </div>
-            {% endif %}
-        {% endfor %}
-    {% else %}
-        <p>No test results recorded.</p>
-    {% endif %}
+          {# Metadata  #}
+          <div class="bug-meta-row">
+            <div class="bug-meta-item"><label>Step</label><span>#{{ bug.step_number }}</span></div>
+            <div class="bug-meta-item"><label>Action</label><span>{{ bug.action }}</span></div>
+            <div class="bug-meta-item"><label>Target</label><span>{{ bug.target }}</span></div>
+            {% if bug.duration_ms %}<div class="bug-meta-item"><label>Duration</label><span>{{ bug.duration_ms }} ms</span></div>{% endif %}
+            <div class="bug-meta-item"><label>Agent</label><span>{{ bug.agent }}</span></div>
+          </div>
 
-    {# Errors #}
-    {% if errors %}
-        <div class="page-break"></div>
-        <h1>Errors Encountered</h1>
-
-        {% for error in errors %}
-            <div class="error-box">
-                <pre>{{ error }}</pre>
+          {# Reproduction path #}
+          {% if bug.repro_path %}
+            <div class="bug-sub-title">Reproduction Path</div>
+            <div class="repro-track">
+              {% for s in bug.repro_path %}
+                <span class="repro-step"><strong>#{{ s.step_number }}</strong>&nbsp;{{ s.action }}{% if s.target %}&nbsp;<span style="color:var(--gray400)">{{ s.target | truncate(28, True) }}</span>{% endif %}</span>
+                <span class="repro-arr">→</span>
+              {% endfor %}
+              <span class="repro-step repro-fail">❌ #{{ bug.step_number }} {{ bug.action }}</span>
             </div>
+          {% endif %}
+
+          {# Screenshots #}
+          {% if bug.visuals and (bug.visuals.before_full or bug.visuals.after_full or bug.visuals.annotated_failure) %}
+            <div class="bug-sub-title">Screenshots</div>
+            <div class="evidence-grid" style="margin-bottom:10px;">
+              {% if bug.visuals.before_full %}<div class="evidence-card"><div class="evidence-label">Before Action</div><img src="{{ bug.visuals.before_full }}" alt="before" /></div>{% endif %}
+              {% if bug.visuals.after_full %}<div class="evidence-card"><div class="evidence-label">After Action</div><img src="{{ bug.visuals.after_full }}" alt="after" /></div>{% endif %}
+              {% if bug.visuals.annotated_failure %}<div class="evidence-card fail"><div class="evidence-label">Annotated Failure</div><img src="{{ bug.visuals.annotated_failure }}" alt="failure annotation" /></div>{% endif %}
+            </div>
+          {% endif %}
+
+          {# Browser console errors #}
+          {% if bug.console_errors %}
+            <details>
+              <summary style="cursor:pointer; font-size:12px; color:var(--blue); font-weight:600; margin: 10px 0 6px;">
+                🖥 Browser Console ({{ bug.console_errors | length }} error/warning(s))
+              </summary>
+              {% for log in bug.console_errors %}
+                {% if log.level == 'error' %}
+                  <div class="clog-error">🔴 {{ log.message }}</div>
+                {% else %}
+                  <div class="clog-warn">⚠️ {{ log.message }}</div>
+                {% endif %}
+              {% endfor %}
+            </details>
+          {% endif %}
+
+          {# Network failures #}
+          {% if bug.network_failures %}
+            <details>
+              <summary style="cursor:pointer; font-size:12px; color:var(--blue); font-weight:600; margin: 10px 0 6px;">
+                🌐 Failed Network Requests ({{ bug.network_failures | length }})
+              </summary>
+              {% for req in bug.network_failures %}
+                <div class="net-fail-row">
+                  <span class="net-status">{{ req.status }}</span>
+                  <span class="net-method">{{ req.method }}</span>
+                  <span class="net-url">{{ req.url }}</span>
+                </div>
+              {% endfor %}
+            </details>
+          {% endif %}
+
+          {# Fix guidance #}
+          <div class="bug-sub-title" style="margin-top:12px;">Suggested Investigation</div>
+          <div style="font-size:12px; color:var(--gray700); line-height:1.7;">
+            {% set err_lower = bug.error_message | lower %}
+            {% if "not found" in err_lower or "no element" in err_lower or "locator" in err_lower or "selector" in err_lower %}
+              The element selector <code>{{ bug.target | truncate(50, True) }}</code> could not be located. Verify the element exists in the DOM at this step, check for dynamic IDs or shadow DOM encapsulation, and confirm the page has fully loaded before the action executes.
+            {% elif "timeout" in err_lower %}
+              The action timed out waiting for a response or element. This often indicates slow server rendering, a blocked or pending network request, or an unresolved loading spinner. Inspect pending requests in the Network tab at this point in the user journey.
+            {% elif "401" in err_lower or "403" in err_lower or "unauthorized" in err_lower or "forbidden" in err_lower %}
+              An auth/permissions failure occurred. Verify session credentials are valid at this point, check CORS and CSRF token handling on the relevant endpoint, and confirm the user has the necessary role/permissions.
+            {% elif "500" in err_lower or "server error" in err_lower %}
+              A server-side error was returned. Check backend application logs around the timestamp of this step. A required dependency (database, cache, external API) may be unavailable, or the submitted payload may fail server-side validation.
+            {% elif "navigation" in err_lower or "url" in err_lower %}
+              Navigation failed. Confirm the target URL is accessible, check for redirect loops or auth walls, and verify the application handles direct URL visits correctly (especially for SPAs which may require client-side routing).
+            {% elif "mutation" in err_lower or "expected" in err_lower or "missing" in err_lower %}
+              An expected API mutation was not confirmed after this form submission. Verify the submit action successfully dispatches the network request (check the POST/PUT in the Network tab), the server acknowledges it with a 2xx, and the response contains the expected entity data.
+            {% else %}
+              Review the error message, correlate with the console errors and network failures above, then reproduce manually by following the Reproduction Path in sequence.
+            {% endif %}
+          </div>
+
+        </div>
+      </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {# ── STEP TIMELINE ───────────────────────────────────────────── #}
+  <div class="page-break"></div>
+  <section>
+    <h2>Step Timeline ({{ test_results | length }} steps)</h2>
+    <div class="timeline">
+      {% for result in test_results %}
+        {% set is_pass = result.status == 'success' %}
+        {% set con_errors = (result.console_logs or []) | selectattr('level', 'in', ['error','warning','warn']) | list %}
+        {% set net_fails = (result.network_logs or []) | selectattr('event', 'equalto', 'response') | selectattr('status', 'ge', 400) | list %}
+        {% set is_slow = result.duration_ms and result.duration_ms >= 3000 %}
+        <div class="tl-step">
+          <div class="tl-dot {{ 'pass' if is_pass else 'fail' }}"></div>
+          <div class="tl-row">
+            <span class="tl-num">{{ result.step_number }}</span>
+            <span class="tl-icon">{{ '✅' if is_pass else '❌' }}</span>
+            <span class="tl-action">{{ result.action or '?' }}</span>
+            <span class="tl-target">{{ result.target or '—' }}</span>
+            <span class="tl-dur">{{ result.duration_ms or '—' }} ms</span>
+            <span class="tl-status">
+              {% if is_pass %}<span class="badge badge-pass">pass</span>
+              {% else %}<span class="badge badge-fail">fail</span>{% endif %}
+            </span>
+            <span class="tl-badges">
+              {% if con_errors %}<span class="tl-badge-err" title="{{ con_errors | length }} console error(s)">🔴 {{ con_errors | length }}</span>{% endif %}
+              {% if net_fails %}<span class="tl-badge-net" title="{{ net_fails | length }} failed request(s)">🌐 {{ net_fails | length }}</span>{% endif %}
+              {% if is_slow %}<span class="tl-badge-slow" title="Slow step: {{ result.duration_ms }} ms">⏱ slow</span>{% endif %}
+            </span>
+          </div>
+          {% if result.error_message %}
+            <div class="tl-error">{{ result.error_message }}</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  {# ── VISUAL EVIDENCE ─────────────────────────────────────────── #}
+  {% set steps_with_visuals = test_results | selectattr('visuals') | list %}
+  {% if steps_with_visuals %}
+  <div class="page-break"></div>
+  <section>
+    <h2>Visual Evidence</h2>
+    {% for result in steps_with_visuals %}
+      <div style="margin-bottom:30px;">
+        <h3>
+          Step {{ result.step_number }} — {{ result.action }}
+          {% if result.target %} on <code>{{ result.target }}</code>{% endif %}
+          &nbsp;{% if result.status == 'success' %}<span class="badge badge-pass">pass</span>
+          {% else %}<span class="badge badge-fail">fail</span>{% endif %}
+        </h3>
+        {% if result.visuals.ocr %}
+          <div class="ocr-note">
+            🔍 <strong>Vision OCR:</strong> {{ result.visuals.ocr.summary or 'No summary' }}
+            (confidence: {{ result.visuals.ocr.confidence or 'unknown' }})
+            {% if result.visuals.ocr.evidence_keywords %}
+              — keywords: <em>{{ result.visuals.ocr.evidence_keywords | join(', ') }}</em>
+            {% endif %}
+          </div>
+        {% endif %}
+        <div class="evidence-grid">
+          {% if result.visuals.before_full %}
+            <div class="evidence-card">
+              <div class="evidence-label">Before — Full Page</div>
+              <img src="{{ result.visuals.before_full }}" alt="before full" />
+            </div>
+          {% endif %}
+          {% if result.visuals.before_crop %}
+            <div class="evidence-card">
+              <div class="evidence-label">Before — Target Crop</div>
+              <img src="{{ result.visuals.before_crop }}" alt="before crop" />
+            </div>
+          {% endif %}
+          {% if result.visuals.after_full %}
+            <div class="evidence-card">
+              <div class="evidence-label">After — Full Page</div>
+              <img src="{{ result.visuals.after_full }}" alt="after full" />
+            </div>
+          {% endif %}
+          {% if result.visuals.after_crop %}
+            <div class="evidence-card">
+              <div class="evidence-label">After — Target Crop</div>
+              <img src="{{ result.visuals.after_crop }}" alt="after crop" />
+            </div>
+          {% endif %}
+          {% if result.visuals.annotated_failure %}
+            <div class="evidence-card fail">
+              <div class="evidence-label">Annotated Failure</div>
+              <img src="{{ result.visuals.annotated_failure }}" alt="failure" />
+            </div>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {# ── NETWORK FAILURES ────────────────────────────────────────── #}
+  {% if all_network_failures %}
+  <div class="page-break"></div>
+  <section>
+    <h2>🌐 Network Failures ({{ all_network_failures | length }} unique)</h2>
+    <table class="log-table">
+      <thead>
+        <tr><th>Step</th><th>Status</th><th>Method</th><th>URL</th><th>Time</th></tr>
+      </thead>
+      <tbody>
+        {% for req in all_network_failures %}
+          <tr>
+            <td class="muted">#{{ req.step }}</td>
+            <td>
+              {% if req.status >= 500 %}
+                <span class="st-5xx">{{ req.status }}</span>
+              {% else %}
+                <span class="st-4xx">{{ req.status }}</span>
+              {% endif %}
+              {% if req.status == 401 %}<span class="muted"> Unauthorized</span>
+              {% elif req.status == 403 %}<span class="muted"> Forbidden</span>
+              {% elif req.status == 404 %}<span class="muted"> Not Found</span>
+              {% elif req.status == 422 %}<span class="muted"> Unprocessable</span>
+              {% elif req.status == 500 %}<span class="muted"> Server Error</span>
+              {% elif req.status == 503 %}<span class="muted"> Unavailable</span>{% endif %}
+            </td>
+            <td class="mono" style="color:var(--blue);">{{ req.method }}</td>
+            <td class="mono" style="word-break:break-all;">{{ req.url }}</td>
+            <td class="muted" style="white-space:nowrap;">{{ req.timestamp }}</td>
+          </tr>
         {% endfor %}
-    {% endif %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
 
-    {# Footer #}
-    <div class="page-break"></div>
-    <h1>Appendix</h1>
+  {# ── BROWSER CONSOLE ERRORS ──────────────────────────────────── #}
+  {% if all_console_errors %}
+  <section>
+    <h2>🖥 Browser Console Errors &amp; Warnings ({{ all_console_errors | length }} unique)</h2>
+    <table class="log-table">
+      <thead>
+        <tr><th>Step</th><th>Level</th><th>Message</th><th>Time</th></tr>
+      </thead>
+      <tbody>
+        {% for log in all_console_errors %}
+          <tr class="lvl-{{ log.level }}">
+            <td class="muted">#{{ log.step }}</td>
+            <td>
+              {% if log.level == 'error' %}
+                <span class="lvl-pill lvl-error">error</span>
+              {% else %}
+                <span class="lvl-pill lvl-warn">warn</span>
+              {% endif %}
+            </td>
+            <td class="mono" style="word-break:break-all;">{{ log.message }}</td>
+            <td class="muted" style="white-space:nowrap;">{{ log.timestamp }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
 
+  {# ── PERFORMANCE ─────────────────────────────────────────────── #}
+  {% if perf.slowest %}
+  <section>
+    <h2>⏱ Performance Analysis</h2>
+    <div class="kpi-grid" style="margin-bottom:20px; grid-template-columns: repeat(auto-fill, minmax(140px,1fr));">
+      <div class="kpi">
+        <div class="kpi-value">{{ perf.avg_ms }}</div>
+        <div class="kpi-label">Avg Step (ms)</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value {% if perf.slow_count > 0 %}red{% endif %}">{{ perf.slow_count }}</div>
+        <div class="kpi-label">Slow Steps (&ge;{{ perf.threshold_ms }}ms)</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-value">{{ perf.slowest[0].duration_ms if perf.slowest else 0 }}</div>
+        <div class="kpi-label">Slowest (ms)</div>
+      </div>
+    </div>
+    <h3>Top 5 Slowest Steps</h3>
+    <div style="border: 1px solid var(--gray200); border-radius: var(--radius); overflow:hidden;">
+      {% for r in perf.slowest %}
+        {% set is_slow_step = r.duration_ms >= perf.threshold_ms %}
+        <div class="perf-row" style="{% if loop.last %}border-bottom:none;{% endif %}">
+          <span class="perf-num">{{ r.step_number }}</span>
+          <span class="perf-action">{{ r.action or '?' }}</span>
+          <span class="perf-target">{{ r.target or '—' }}</span>
+          <div class="perf-bar-wrap">
+            <div class="perf-bar-fill {{ 'slow' if is_slow_step else '' }}"
+                 style="width:{{ r._bar_pct | default(100) }}%"></div>
+          </div>
+          <span class="perf-ms {{ 'slow' if is_slow_step else '' }}">
+            {{ r.duration_ms }} ms {% if is_slow_step %}⚠{% endif %}
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {# ── FULL AUDIT TABLE ────────────────────────────────────────── #}
+  <div class="page-break"></div>
+  <section>
+    <h2>Full Step Audit</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Agent</th><th>Action</th><th>Target / Selector</th>
+          <th>Status</th><th>ms</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for result in test_results %}
+          <tr>
+            <td>{{ result.step_number }}</td>
+            <td><span class="badge badge-info">{{ result.agent }}</span></td>
+            <td class="mono">{{ result.action or '—' }}</td>
+            <td class="mono" style="max-width:240px; word-break:break-all;">{{ result.target or '—' }}</td>
+            <td>
+              {% if result.status == 'success' %}<span style="color:var(--green);font-weight:700;">✓ pass</span>
+              {% elif result.status == 'failed' %}<span style="color:var(--red);font-weight:700;">✗ fail</span>
+              {% else %}{{ result.status }}{% endif %}
+            </td>
+            <td class="muted">{{ result.duration_ms or '—' }}</td>
+            <td style="max-width:180px; word-break:break-word; font-size:11px; color:var(--red);">
+              {{ result.error_message or '' }}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  {# ── ERRORS ──────────────────────────────────────────────────── #}
+  {% if errors %}
+  <div class="page-break"></div>
+  <section>
+    <h2>Errors &amp; Warnings ({{ errors | length }})</h2>
+    {% for error in errors %}
+      <div class="error-item">{{ error }}</div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {# ── CONFIG ──────────────────────────────────────────────────── #}
+  <div class="page-break"></div>
+  <section>
     <h2>Configuration</h2>
     <pre>{{ config | tojson(indent=2) }}</pre>
+  </section>
 
-    <hr>
-    <p style="text-align: center; color: #666; font-size: 9pt;">
-        Generated by WebQA-Plus v1.0.0 | Autonomous AI Web QA Testing
-    </p>
+  <div class="footer">
+    Generated by <strong>WebQA-Plus</strong> · Autonomous AI Web QA Testing ·
+    {{ generated_at | format_datetime }}
+  </div>
+
+</div>
 </body>
 </html>

@@ -187,8 +187,8 @@ class TestConfig(BaseModel):
     path_discovery_boost: int = 1
     form_validation_pass: bool = True
     email_verification_enabled: bool = False
-    email_provider: str = "1secmail"
-    email_provider_base_url: str = "https://www.1secmail.com/api/v1/"
+    email_provider: str = "guerrillamail"
+    email_provider_base_url: str = "https://api.guerrillamail.com/ajax.php"
     email_poll_timeout_seconds: int = 120
     email_poll_interval_seconds: int = 5
     email_request_timeout_seconds: float = 12.0
@@ -211,6 +211,8 @@ class TestStatus(BaseModel):
     errors: List[str]
     logs: List[Dict[str, str]]
     debug_errors: List[str] = []
+    llm_turns: List[Dict] = []
+    learning_memory: List[str] = []
     report_path: Optional[str] = None
     current_objective: Optional[str] = None
 
@@ -412,6 +414,8 @@ def create_app() -> FastAPI:
             "errors": [],
             "debug_errors": [],
             "logs": [],
+            "llm_turns": [],
+            "learning_memory": [],
             "report_path": None,
             "current_objective": (config.test_instruction or "").strip() or None,
             "start_time": datetime.now().isoformat(),
@@ -442,6 +446,8 @@ def create_app() -> FastAPI:
             errors=session["errors"],
             logs=session["logs"],
             debug_errors=session.get("debug_errors", []),
+            llm_turns=session.get("llm_turns", []),
+            learning_memory=session.get("learning_memory", []),
             report_path=session.get("report_path"),
             current_objective=session.get("current_objective"),
         )
@@ -534,7 +540,10 @@ def create_app() -> FastAPI:
 
         try:
             while True:
-                session = test_sessions[session_id]
+                session = test_sessions.get(session_id)
+                if session is None:
+                    await websocket.close(code=4004)
+                    break
                 await websocket.send_json(
                     {
                         "status": session["status"],
@@ -545,12 +554,22 @@ def create_app() -> FastAPI:
                         "flows_discovered": session["flows_discovered"],
                         "test_results": session["test_results"],
                         "current_objective": session.get("current_objective"),
+                        "llm_turns": session.get("llm_turns", [])[-30:],
                         "logs": session["logs"][-50:],
+                        "errors": session.get("errors", []),
+                        "debug_errors": session.get("debug_errors", []),
+                        "learning_memory": session.get("learning_memory", [])[-15:],
                     }
                 )
                 await asyncio.sleep(1)
         except WebSocketDisconnect:
             pass
+        except Exception:
+            # Connection lost or serialization error — don't crash
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
@@ -615,9 +634,9 @@ async def run_test_session(session_id: str):
         app_config.testing.email_verification_enabled = config_data.get(
             "email_verification_enabled", False
         )
-        app_config.testing.email_provider = config_data.get("email_provider", "1secmail")
+        app_config.testing.email_provider = config_data.get("email_provider", "guerrillamail")
         app_config.testing.email_provider_base_url = config_data.get(
-            "email_provider_base_url", "https://www.1secmail.com/api/v1/"
+            "email_provider_base_url", "https://api.guerrillamail.com/ajax.php"
         )
         app_config.testing.email_poll_timeout_seconds = int(
             config_data.get("email_poll_timeout_seconds", 120)
@@ -690,6 +709,12 @@ async def run_test_session(session_id: str):
             session["urls_visited"] = len(state.get("visited_urls", []))
             session["flows_discovered"] = len(state.get("discovered_flows", []))
             session["test_results"] = len(state.get("test_results", []))
+            incoming_turns = list(state.get("llm_turns") or [])
+            if incoming_turns:
+                session["llm_turns"] = incoming_turns[-100:]
+            incoming_learnings = list(state.get("learning_memory") or [])
+            if incoming_learnings:
+                session["learning_memory"] = incoming_learnings[-30:]
 
             current_state = str(state.get("current_state", "running"))
             _append_log(

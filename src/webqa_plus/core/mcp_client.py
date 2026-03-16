@@ -80,6 +80,7 @@ class MCPClient:
             '[role="link"]',
             '[role="checkbox"]',
             '[role="radio"]',
+            '[role="option"]',
             '[tabindex]:not([tabindex="-1"])',
         ]
 
@@ -256,43 +257,58 @@ class MCPClient:
                     pass
 
             if action_type == "click":
+                # For dropdown options and elements unlikely to open popups (role=option, listitem,
+                # or text-based targets that resolved via get_by_role/get_by_text), skip the
+                # expect_page wrapper and click directly to avoid the double-click bug.
+                is_dropdown_element = False
                 try:
-                    async with page.context.expect_page(timeout=2500) as popup_info:
-                        await locator.click(timeout=5000)
-                    popup_page = await popup_info.value
+                    elem_role = await locator.get_attribute("role") or ""
+                    if elem_role in {"option", "listitem", "menuitem"}:
+                        is_dropdown_element = True
+                except Exception:
+                    pass
+
+                if is_dropdown_element:
+                    await locator.click(timeout=5000)
+                else:
                     try:
-                        await popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except Exception:
-                        pass
-                    popup_url = popup_page.url or ""
-                    popup_validated = bool(popup_url)
-                    await popup_page.close()
-                except Exception as click_error:
-                    error_text = str(click_error).lower()
-                    if "intercepts pointer events" in error_text:
-                        await self._dismiss_blocking_overlays(page)
-                        locator = await self._resolve_target_locator(page, target)
-                        await self._prepare_locator_for_action(page, locator)
+                        async with page.context.expect_page(timeout=500) as popup_info:
+                            await locator.click(timeout=5000)
+                        popup_page = await popup_info.value
                         try:
-                            async with page.context.expect_page(timeout=2000) as popup_info:
-                                await locator.click(timeout=5000)
-                            popup_page = await popup_info.value
-                            try:
-                                await popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
-                            except Exception:
-                                pass
-                            popup_url = popup_page.url or ""
-                            popup_validated = bool(popup_url)
-                            await popup_page.close()
+                            await popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
                         except Exception:
-                            if await self._is_locator_within_active_modal(locator):
-                                await locator.click(timeout=5000, force=True)
-                            else:
-                                raise RuntimeError(
-                                    "Blocked by active modal overlay; target is outside dialog scope"
-                                )
-                    else:
-                        await locator.click(timeout=5000)
+                            pass
+                        popup_url = popup_page.url or ""
+                        popup_validated = bool(popup_url)
+                        await popup_page.close()
+                    except Exception as click_error:
+                        error_text = str(click_error).lower()
+                        if "intercepts pointer events" in error_text:
+                            await self._dismiss_blocking_overlays(page)
+                            locator = await self._resolve_target_locator(page, target)
+                            await self._prepare_locator_for_action(page, locator)
+                            try:
+                                async with page.context.expect_page(timeout=500) as popup_info:
+                                    await locator.click(timeout=5000)
+                                popup_page = await popup_info.value
+                                try:
+                                    await popup_page.wait_for_load_state("domcontentloaded", timeout=5000)
+                                except Exception:
+                                    pass
+                                popup_url = popup_page.url or ""
+                                popup_validated = bool(popup_url)
+                                await popup_page.close()
+                            except Exception:
+                                if await self._is_locator_within_active_modal(locator):
+                                    await locator.click(timeout=5000, force=True)
+                                else:
+                                    raise RuntimeError(
+                                        "Blocked by active modal overlay; target is outside dialog scope"
+                                    )
+                        else:
+                            # expect_page timed out (no popup opened) — first click already fired, done.
+                            pass
             elif action_type == "type":
                 await self._fill_with_fallback(page, locator, target, value or "")
             elif action_type == "clear":
@@ -311,7 +327,10 @@ class MCPClient:
 
             # Wait for any navigation or network activity
             if wait_for_network_idle:
-                await active_page.wait_for_load_state("networkidle", timeout=5000)
+                try:
+                    await active_page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass  # Non-fatal; page may have SPA updates without full networkidle
 
             if action_type == "click":
                 await self._attempt_post_click_picker_completion(active_page, target)
@@ -434,6 +453,23 @@ class MCPClient:
             except Exception:
                 pass
             await locator.fill(value, timeout=5000)
+            # Dispatch React synthetic events so controlled inputs register the change.
+            try:
+                await locator.evaluate(
+                    """(el, v) => {
+                        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        )?.set || Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        )?.set;
+                        if (nativeInputValueSetter) nativeInputValueSetter.call(el, v);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    value,
+                )
+            except Exception:
+                pass
             try:
                 await locator.press("Tab", timeout=1000)
             except Exception:
@@ -735,6 +771,43 @@ class MCPClient:
                 fallback_selector = self._selector_fallbacks.get(element_id)
                 if fallback_selector:
                     return page.locator(fallback_selector).first
+
+        # If target looks like plain text / display label (no CSS special chars typically
+        # used in selectors), try to find it as a dropdown option — this handles LLM
+        # responses like target="Salon" or target="Legal Services" from open comboboxes.
+        stripped = (target or "").strip()
+        if stripped and not any(c in stripped for c in ["[", ".", "#", ":", ">", "+"]):
+            # Priority 1: role="option" elements with matching text (Radix/Headless UI combobox options)
+            option_locator = page.get_by_role("option", name=stripped).first
+            try:
+                if await option_locator.count() > 0:
+                    print(f"[LOCATOR] found role=option for {stripped!r}", flush=True)
+                    return option_locator
+            except Exception:
+                pass
+
+            # Priority 2: listbox item / combobox item inside a Radix popper content wrapper
+            popper_locator = page.locator(
+                f'[data-radix-popper-content-wrapper] [role="option"], '
+                f'[data-radix-popper-content-wrapper] [role="listitem"], '
+                f'[data-radix-collection-item], '
+                f'[cmdk-item], [data-value]'
+            ).filter(has_text=stripped).first
+            try:
+                if await popper_locator.count() > 0:
+                    print(f"[LOCATOR] found popper-item for {stripped!r}", flush=True)
+                    return popper_locator
+            except Exception:
+                pass
+
+            # Priority 3: any element with exact text match (fallback)
+            text_locator = page.get_by_text(stripped, exact=True).first
+            try:
+                if await text_locator.count() > 0:
+                    print(f"[LOCATOR] found get_by_text for {stripped!r}", flush=True)
+                    return text_locator
+            except Exception:
+                pass
 
         return locator
 

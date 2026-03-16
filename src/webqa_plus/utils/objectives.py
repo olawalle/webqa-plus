@@ -34,7 +34,9 @@ def directive_to_objectives(instruction: str) -> Dict[str, Any]:
                 "critical_paths": [],
                 "required_elements": [],
                 "priority": 1,
-                "strict": False,
+                # Do NOT set strict=False here — _objective_is_strict() uses the
+                # name-based fallback ("user directed objective" → True) to enable
+                # strict focus mode for user instructions.
                 "dynamic": True,
             }
         ]

@@ -149,11 +149,13 @@ class TestEngine:
                     "llm_calls": 0,
                     "total_tokens": 0,
                     "estimated_cost": 0.0,
+                    "llm_turns": [],
                     "config": self.config.model_dump(),
                     "auth_completed": False,
                     "artifacts": {},
                     "errors": [],
                     "should_stop": False,
+                    "learning_memory": [],
                 }
                 self.latest_graph_state = pre_auth_state
                 await self._update_visual_overlay(pre_auth_state)
@@ -221,11 +223,13 @@ class TestEngine:
                 "llm_calls": 0,
                 "total_tokens": 0,
                 "estimated_cost": 0.0,
+                "llm_turns": [],
                 "config": self.config.model_dump(),
                 "auth_completed": auth_success,
                 "artifacts": {},
                 "errors": [],
                 "should_stop": False,
+                "learning_memory": [],
             }
 
             try:

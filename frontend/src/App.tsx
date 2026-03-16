@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Bot,
+  Brain,
+  Eye,
   FileText,
   Globe,
   Play,
@@ -40,6 +42,13 @@ type LogEntry = {
   message?: string;
 };
 
+type LlmTurn = {
+  ts: string;
+  agent: string;
+  prompt: string;
+  response: string;
+};
+
 type TestStatus = {
   status: string;
   progress: number;
@@ -52,6 +61,8 @@ type TestStatus = {
   errors: string[];
   debug_errors?: string[];
   current_objective?: string;
+  llm_turns?: LlmTurn[];
+  learning_memory?: string[];
 };
 
 type ReportItem = {
@@ -66,6 +77,11 @@ function App() {
   const [steerInstruction, setSteerInstruction] = useState("");
   const [reports, setReports] = useState<ReportItem[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [llmTurns, setLlmTurns] = useState<LlmTurn[]>([]);
+  const [activeTab, setActiveTab] = useState<"logs" | "ai" | "memory">("logs");
+  const [aiFilter, setAiFilter] = useState<string>("all");
+  const [expandedTurns, setExpandedTurns] = useState<Set<number>>(new Set());
+  const aiScrollRef = useRef<HTMLDivElement>(null);
   const [testStatus, setTestStatus] = useState<TestStatus>({
     status: "ready",
     progress: 0,
@@ -118,44 +134,11 @@ function App() {
 
   const latestReport = useMemo(() => reports[0] ?? null, [reports]);
 
-  useEffect(() => {
-    void loadReports();
-  }, []);
-
-  useEffect(() => {
-    // Dynamically fetch Gemini models when the API key is available
-    if (form.api_key) void loadModels();
-  }, [form.api_key]);
-
-  useEffect(() => {
-    if (!sessionId) return;
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(
-      `${protocol}://${window.location.host}/ws/${sessionId}`,
-    );
-    ws.onmessage = (event) => {
-      const data: TestStatus = JSON.parse(event.data);
-      setTestStatus(data);
-      setLogs((prev) => {
-        const existingKeys = new Set(
-          prev.map((log) => `${log.ts}-${log.message}`),
-        );
-        const merged = [...prev];
-        for (const log of data.logs || []) {
-          const key = `${log.ts}-${log.message}`;
-          if (!existingKeys.has(key)) {
-            merged.push(log);
-            existingKeys.add(key);
-          }
-        }
-        return merged.slice(-250);
-      });
-      if (data.status === "completed" || data.status === "failed") {
-        void loadReports();
-      }
-    };
-    return () => ws.close();
-  }, [sessionId]);
+  async function loadReports() {
+    const response = await fetch("/api/reports");
+    const data = await response.json();
+    setReports(data.reports || []);
+  }
 
   async function loadModels() {
     const query = form.api_key
@@ -181,11 +164,101 @@ function App() {
     }
   }
 
-  async function loadReports() {
-    const response = await fetch("/api/reports");
-    const data = await response.json();
-    setReports(data.reports || []);
-  }
+  useEffect(() => {
+    async function fetchReports() {
+      await loadReports();
+    }
+    fetchReports();
+  }, []);
+
+  useEffect(() => {
+    // Dynamically fetch Gemini models when the API key is available
+    if (form.api_key) {
+      (async () => {
+        await loadModels();
+      })();
+    }
+  }, [form.api_key]);
+
+  // Auto-scroll AI conversation to bottom on new turns
+  useEffect(() => {
+    if (activeTab === "ai" && aiScrollRef.current) {
+      aiScrollRef.current.scrollTop = aiScrollRef.current.scrollHeight;
+    }
+  }, [llmTurns, activeTab]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let disposed = false;
+    let ws: WebSocket | null = null;
+    let retryDelay = 1000;
+    const MAX_RETRY = 15000;
+
+    function connect() {
+      if (disposed) return;
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(
+        `${protocol}://${window.location.host}/ws/${sessionId}`,
+      );
+
+      ws.onopen = () => {
+        retryDelay = 1000; // reset backoff on success
+      };
+
+      ws.onmessage = (event) => {
+        const data: TestStatus = JSON.parse(event.data);
+        setTestStatus(data);
+        setLogs((prev) => {
+          const existingKeys = new Set(
+            prev.map((log) => `${log.ts}-${log.message}`),
+          );
+          const merged = [...prev];
+          for (const log of data.logs || []) {
+            const key = `${log.ts}-${log.message}`;
+            if (!existingKeys.has(key)) {
+              merged.push(log);
+              existingKeys.add(key);
+            }
+          }
+          return merged.slice(-250);
+        });
+        setLlmTurns((prev) => {
+          const existingKeys = new Set(
+            prev.map((t) => `${t.ts}-${t.agent}-${t.prompt.slice(0, 20)}`),
+          );
+          const merged = [...prev];
+          for (const turn of data.llm_turns || []) {
+            const key = `${turn.ts}-${turn.agent}-${turn.prompt.slice(0, 20)}`;
+            if (!existingKeys.has(key)) {
+              merged.push(turn);
+              existingKeys.add(key);
+            }
+          }
+          return merged.slice(-100);
+        });
+        if (data.status === "completed" || data.status === "failed") {
+          void loadReports();
+        }
+      };
+
+      ws.onclose = () => {
+        if (disposed) return;
+        // Auto-reconnect with exponential backoff
+        setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 1.5, MAX_RETRY);
+      };
+
+      ws.onerror = () => {
+        // onclose will fire after onerror, triggering reconnect
+      };
+    }
+
+    connect();
+    return () => {
+      disposed = true;
+      ws?.close();
+    };
+  }, [sessionId]);
 
   async function startTest() {
     if (!canStart) return;
@@ -196,6 +269,7 @@ function App() {
         ts: new Date().toISOString(),
       },
     ]);
+    setLlmTurns([]);
     const payload = {
       provider: GEMINI_PROVIDER,
       ...form,
@@ -276,7 +350,15 @@ function App() {
                 Open Report
               </Button>
             ) : null}
-            <Badge variant={statusVariant as any}>
+            <Badge
+              variant={
+                statusVariant as
+                  | "success"
+                  | "destructive"
+                  | "warning"
+                  | "secondary"
+              }
+            >
               {testStatus.status.toUpperCase()}
             </Badge>
           </div>
@@ -592,40 +674,303 @@ function App() {
 
         <div className="grid gap-6 lg:grid-cols-2">
           <Card>
-            <CardHeader>
-              <CardTitle>Activity Log</CardTitle>
+            <CardHeader className="pb-2">
+              <div className="flex gap-1">
+                <button
+                  className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors ${
+                    activeTab === "logs"
+                      ? "bg-slate-900 text-white"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  onClick={() => setActiveTab("logs")}
+                >
+                  <Activity className="h-3.5 w-3.5" /> Activity Log
+                </button>
+                <button
+                  className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors ${
+                    activeTab === "ai"
+                      ? "bg-indigo-600 text-white"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  onClick={() => setActiveTab("ai")}
+                >
+                  <Eye className="h-3.5 w-3.5" /> Gemini Vision
+                  {llmTurns.length > 0 && (
+                    <span className="ml-1 rounded-full bg-indigo-500/30 px-1.5 text-xs">
+                      {llmTurns.length}
+                    </span>
+                  )}
+                  {isRunning && llmTurns.length > 0 && (
+                    <span className="ml-1 relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                    </span>
+                  )}
+                </button>
+                <button
+                  className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition-colors ${
+                    activeTab === "memory"
+                      ? "bg-amber-600 text-white"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                  onClick={() => setActiveTab("memory")}
+                >
+                  <Brain className="h-3.5 w-3.5" /> Agent Memory
+                  {(testStatus.learning_memory?.length ?? 0) > 0 && (
+                    <span className="ml-1 rounded-full bg-amber-500/30 px-1.5 text-xs">
+                      {testStatus.learning_memory!.length}
+                    </span>
+                  )}
+                </button>
+              </div>
             </CardHeader>
             <CardContent>
-              <div className="max-h-[300px] space-y-2 overflow-auto rounded-md border bg-slate-950 p-3 font-mono text-xs text-slate-200">
-                {logs.length === 0 ? (
-                  <div>No logs yet.</div>
-                ) : (
-                  [...logs].reverse().map((log, index) => (
-                    <div key={`${log.ts}-${index}`} className="flex gap-2">
-                      <span className="text-slate-400">
-                        {log.ts
-                          ? new Date(log.ts).toLocaleTimeString()
-                          : "--:--:--"}
-                      </span>
-                      <span>{log.message}</span>
+              {activeTab === "logs" ? (
+                <>
+                  <div className="max-h-[300px] space-y-2 overflow-auto rounded-md border bg-slate-950 p-3 font-mono text-xs text-slate-200">
+                    {logs.length === 0 ? (
+                      <div>No logs yet.</div>
+                    ) : (
+                      [...logs].reverse().map((log, index) => (
+                        <div key={`${log.ts}-${index}`} className="flex gap-2">
+                          <span className="text-slate-400">
+                            {log.ts
+                              ? new Date(log.ts).toLocaleTimeString()
+                              : "--:--:--"}
+                          </span>
+                          <span>{log.message}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  {testStatus.errors?.length > 0 && (
+                    <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                      {testStatus.errors[0]}
+                      {testStatus.debug_errors?.length ? (
+                        <pre className="mt-2 whitespace-pre-wrap text-xs">
+                          {
+                            testStatus.debug_errors[
+                              testStatus.debug_errors.length - 1
+                            ]
+                          }
+                        </pre>
+                      ) : null}
                     </div>
-                  ))
-                )}
-              </div>
-              {testStatus.errors?.length > 0 && (
-                <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-                  {testStatus.errors[0]}
-                  {testStatus.debug_errors?.length ? (
-                    <pre className="mt-2 whitespace-pre-wrap text-xs">
-                      {
-                        testStatus.debug_errors[
-                          testStatus.debug_errors.length - 1
-                        ]
-                      }
-                    </pre>
-                  ) : null}
+                  )}
+                </>
+              ) : activeTab === "ai" ? (
+                <div className="space-y-2">
+                  {/* Agent filter bar */}
+                  <div className="flex gap-1 flex-wrap">
+                    {[
+                      "all",
+                      "vision-analyze",
+                      "explorer",
+                      "tester",
+                      "tester/vision",
+                      "tester/ocr",
+                      "validator",
+                    ].map((filter) => (
+                      <button
+                        key={filter}
+                        className={`rounded-full px-2.5 py-0.5 text-xs font-medium border transition-colors ${
+                          aiFilter === filter
+                            ? "bg-indigo-600 text-white border-indigo-600"
+                            : "bg-white text-slate-600 border-slate-200 hover:border-indigo-300"
+                        }`}
+                        onClick={() => setAiFilter(filter)}
+                      >
+                        {filter === "all"
+                          ? "All"
+                          : filter === "vision-analyze"
+                            ? "👁 Vision"
+                            : filter}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div
+                    ref={aiScrollRef}
+                    className="max-h-[420px] space-y-3 overflow-auto scroll-smooth"
+                  >
+                    {llmTurns.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center py-10 text-center">
+                        <Eye className="h-10 w-10 text-indigo-200 mb-3" />
+                        <p className="text-sm text-muted-foreground">
+                          No AI conversations yet. Start a test to see live
+                          Gemini vision analysis and agent reasoning.
+                        </p>
+                      </div>
+                    ) : (
+                      (() => {
+                        const agentColors: Record<string, string> = {
+                          explorer:
+                            "bg-indigo-50 text-indigo-700 border-indigo-200",
+                          tester:
+                            "bg-emerald-50 text-emerald-700 border-emerald-200",
+                          "tester/ocr":
+                            "bg-amber-50 text-amber-700 border-amber-200",
+                          "tester/vision":
+                            "bg-sky-50 text-sky-700 border-sky-200",
+                          "tester/vision-analyze":
+                            "bg-violet-50 text-violet-700 border-violet-200",
+                          "tester/visual":
+                            "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200",
+                          validator: "bg-rose-50 text-rose-700 border-rose-200",
+                        };
+                        const agentIcons: Record<string, string> = {
+                          explorer: "🔍",
+                          tester: "🧪",
+                          "tester/ocr": "📝",
+                          "tester/vision": "👁",
+                          "tester/vision-analyze": "🔬",
+                          "tester/visual": "🎯",
+                          validator: "✅",
+                        };
+
+                        const filtered =
+                          aiFilter === "all"
+                            ? llmTurns
+                            : aiFilter === "vision-analyze"
+                              ? llmTurns.filter(
+                                  (t) =>
+                                    t.agent === "tester/vision-analyze" ||
+                                    t.agent === "tester/vision",
+                                )
+                              : llmTurns.filter((t) => t.agent === aiFilter);
+
+                        return filtered.map((turn, index) => {
+                          const badgeClass =
+                            agentColors[turn.agent] ??
+                            "bg-slate-50 text-slate-600 border-slate-200";
+                          const icon = agentIcons[turn.agent] ?? "🤖";
+                          const isExpanded = expandedTurns.has(index);
+                          const promptPreview =
+                            turn.prompt.length > 200 && !isExpanded
+                              ? turn.prompt.slice(0, 200) + "…"
+                              : turn.prompt;
+                          const responsePreview =
+                            turn.response.length > 300 && !isExpanded
+                              ? turn.response.slice(0, 300) + "…"
+                              : turn.response;
+                          const canExpand =
+                            turn.prompt.length > 200 ||
+                            turn.response.length > 300;
+
+                          return (
+                            <div
+                              key={`${turn.ts}-${index}`}
+                              className={`rounded-lg border p-3 shadow-sm space-y-2 transition-all ${
+                                turn.agent === "tester/vision-analyze"
+                                  ? "border-violet-200 bg-violet-50/30"
+                                  : "bg-white"
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-base">{icon}</span>
+                                  <span
+                                    className={`rounded-full border px-2 py-0.5 text-xs font-semibold uppercase tracking-wide ${badgeClass}`}
+                                  >
+                                    {turn.agent === "tester/vision-analyze"
+                                      ? "Vision Analysis"
+                                      : turn.agent}
+                                  </span>
+                                </div>
+                                <span className="text-xs text-muted-foreground">
+                                  {turn.ts
+                                    ? new Date(turn.ts).toLocaleTimeString()
+                                    : ""}
+                                </span>
+                              </div>
+                              {/* Agent prompt */}
+                              <div className="rounded-md bg-slate-900 p-2 font-mono text-xs text-slate-200">
+                                <span className="text-slate-500 mr-1 select-none">
+                                  →
+                                </span>
+                                <span className="whitespace-pre-wrap break-all">
+                                  {promptPreview}
+                                </span>
+                              </div>
+                              {/* Gemini response */}
+                              <div className="rounded-md bg-indigo-950 p-2 font-mono text-xs text-indigo-100">
+                                <span className="text-indigo-400 mr-1 select-none">
+                                  ←
+                                </span>
+                                <span className="whitespace-pre-wrap break-all">
+                                  {responsePreview}
+                                </span>
+                              </div>
+                              {canExpand && (
+                                <button
+                                  className="text-xs text-indigo-500 hover:text-indigo-700 font-medium"
+                                  onClick={() =>
+                                    setExpandedTurns((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(index)) next.delete(index);
+                                      else next.add(index);
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  {isExpanded
+                                    ? "Show less"
+                                    : "Show full conversation"}
+                                </button>
+                              )}
+                            </div>
+                          );
+                        });
+                      })()
+                    )}
+                    {isRunning && llmTurns.length > 0 && (
+                      <div className="flex items-center gap-2 py-2 px-3 rounded-md bg-indigo-50 border border-indigo-100 text-xs text-indigo-600">
+                        <span className="relative flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+                        </span>
+                        Gemini is analyzing the page…
+                      </div>
+                    )}
+                  </div>
                 </div>
-              )}
+              ) : activeTab === "memory" ? (
+                <div className="max-h-[420px] space-y-2 overflow-auto">
+                  {(testStatus.learning_memory?.length ?? 0) === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-10 text-center">
+                      <Brain className="h-10 w-10 text-amber-200 mb-3" />
+                      <p className="text-sm text-muted-foreground">
+                        No learnings yet. The agent accumulates insights as it
+                        interacts with the app during testing.
+                      </p>
+                    </div>
+                  ) : (
+                    [...(testStatus.learning_memory ?? [])]
+                      .reverse()
+                      .map((insight, i) => (
+                        <div
+                          key={i}
+                          className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-900"
+                        >
+                          <span className="mr-1.5 font-semibold text-amber-600">
+                            #{testStatus.learning_memory!.length - i}
+                          </span>
+                          {insight}
+                        </div>
+                      ))
+                  )}
+                  {isRunning &&
+                    (testStatus.learning_memory?.length ?? 0) > 0 && (
+                      <div className="flex items-center gap-2 py-2 px-3 rounded-md bg-amber-50 border border-amber-100 text-xs text-amber-600">
+                        <span className="relative flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                        </span>
+                        Agent is learning from interactions…
+                      </div>
+                    )}
+                </div>
+              ) : null}
             </CardContent>
           </Card>
 

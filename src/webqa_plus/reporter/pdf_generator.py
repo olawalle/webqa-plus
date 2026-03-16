@@ -79,6 +79,12 @@ class PDFReportGenerator:
         if total_steps > 0:
             coverage_pct = (successful_steps / total_steps) * 100
 
+        # Build rich diagnostic data
+        failures = self._build_failure_deep_dives(test_results)
+        all_console_errors = self._aggregate_console_errors(test_results)
+        all_network_failures = self._aggregate_network_failures(test_results)
+        perf = self._build_perf_stats(test_results)
+
         return {
             "title": "WebQA-Plus Test Report",
             "generated_at": datetime.now(),
@@ -101,7 +107,160 @@ class PDFReportGenerator:
             "test_results": test_results,
             "errors": state.get("errors", []),
             "duration": data.get("duration", 0),
+            "visited_urls": state.get("visited_urls", []),
+            "objectives": self._extract_objectives(state),
+            "mutation_assertions": state.get("artifacts", {}).get("mutation_assertions", {}),
+            # Diagnostic sections
+            "failures": failures,
+            "all_console_errors": all_console_errors,
+            "all_network_failures": all_network_failures,
+            "perf": perf,
         }
+
+    def _build_failure_deep_dives(self, test_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Build per-failure diagnostic objects with severity, reproduction path, and log excerpts."""
+        failures = []
+        total = len(test_results)
+        for i, result in enumerate(test_results):
+            if result.get("status") != "failed":
+                continue
+
+            step_num = result.get("step_number", i + 1)
+            action = str(result.get("action") or "")
+
+            # Severity heuristic: position + action type
+            is_early = step_num <= max(3, total // 4)
+            is_submit = any(k in action.lower() for k in ("submit", "navigate", "click"))
+            if step_num == 1 or (is_early and is_submit):
+                severity = "CRITICAL"
+            elif step_num <= total // 2 or "submit" in action.lower():
+                severity = "HIGH"
+            else:
+                severity = "MEDIUM"
+
+            # Console errors/warnings captured during this step
+            console_errors = [
+                log for log in (result.get("console_logs") or [])
+                if isinstance(log, dict)
+                and str(log.get("level", "")).lower() in {"error", "warning", "warn"}
+            ][:8]
+
+            # Failed network requests (4xx/5xx responses) during this step
+            network_failures = [
+                req for req in (result.get("network_logs") or [])
+                if isinstance(req, dict)
+                and req.get("event") == "response"
+                and int(req.get("status", 0)) >= 400
+            ][:8]
+
+            # Reproduction path: last 6 successful steps before this failure
+            prior_success = [s for s in test_results[:i] if s.get("status") == "success"]
+            repro_path = prior_success[-6:]
+
+            failures.append({
+                "bug_id": f"BUG-{len(failures) + 1:03d}",
+                "severity": severity,
+                "step_number": step_num,
+                "action": action,
+                "target": str(result.get("target") or "—"),
+                "agent": str(result.get("agent") or "tester"),
+                "error_message": str(result.get("error_message") or "Unknown error"),
+                "console_errors": console_errors,
+                "network_failures": network_failures,
+                "repro_path": repro_path,
+                "visuals": result.get("visuals") or {},
+                "duration_ms": result.get("duration_ms"),
+            })
+        return failures
+
+    def _aggregate_console_errors(self, test_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collect unique console errors and warnings across all steps."""
+        seen: set = set()
+        entries = []
+        for result in test_results:
+            for log in (result.get("console_logs") or []):
+                if not isinstance(log, dict):
+                    continue
+                level = str(log.get("level", "")).lower()
+                if level not in {"error", "warning", "warn"}:
+                    continue
+                msg = str(log.get("message", "")).strip()
+                if not msg or msg in seen:
+                    continue
+                seen.add(msg)
+                entries.append({
+                    "step": result.get("step_number"),
+                    "level": level,
+                    "message": msg,
+                    "timestamp": log.get("timestamp", ""),
+                })
+        return entries[:60]
+
+    def _aggregate_network_failures(self, test_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Collect unique 4xx/5xx responses across all steps."""
+        seen: set = set()
+        failures = []
+        for result in test_results:
+            for req in (result.get("network_logs") or []):
+                if not isinstance(req, dict):
+                    continue
+                if req.get("event") != "response":
+                    continue
+                status = int(req.get("status", 0))
+                if status < 400:
+                    continue
+                url = str(req.get("url", ""))
+                key = f"{status}:{url}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                failures.append({
+                    "step": result.get("step_number"),
+                    "method": req.get("method", "GET"),
+                    "url": url,
+                    "status": status,
+                    "timestamp": req.get("timestamp", ""),
+                })
+        return failures[:40]
+
+    def _build_perf_stats(self, test_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compute performance stats: average, slowest steps, slow-step count."""
+        threshold_ms = 3000
+        timed = [r for r in test_results if r.get("duration_ms")]
+        if not timed:
+            return {"avg_ms": 0, "slowest": [], "slow_count": 0, "threshold_ms": threshold_ms}
+
+        avg_ms = int(sum(r["duration_ms"] for r in timed) / len(timed))
+        slowest = sorted(timed, key=lambda r: -(r.get("duration_ms") or 0))[:5]
+        slow_count = sum(1 for r in timed if (r.get("duration_ms") or 0) >= threshold_ms)
+        max_ms = max(r.get("duration_ms", 0) for r in slowest) if slowest else 1
+
+        for r in slowest:
+            r["_bar_pct"] = int(((r.get("duration_ms") or 0) / max(max_ms, 1)) * 100)
+
+        return {
+            "avg_ms": avg_ms,
+            "slowest": slowest,
+            "slow_count": slow_count,
+            "threshold_ms": threshold_ms,
+        }
+
+    def _extract_objectives(self, state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Pull objectives from state or from the nested config.objectives structure."""
+        # Direct field (if ever stored on state)
+        direct = state.get("objectives", [])
+        if direct:
+            return [o if isinstance(o, dict) else {"description": str(o)} for o in direct]
+        # Nested under config.objectives.objectives
+        cfg = state.get("config", {})
+        obj_cfg = cfg.get("objectives", {}) if isinstance(cfg, dict) else {}
+        if isinstance(obj_cfg, dict):
+            items = obj_cfg.get("objectives", [])
+        elif isinstance(obj_cfg, list):
+            items = obj_cfg
+        else:
+            items = []
+        return [o if isinstance(o, dict) else {"description": str(o)} for o in items]
 
     def _as_dict(self, value: Any) -> Dict[str, Any]:
         """Convert model-like objects to dictionaries for templating."""
