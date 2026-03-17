@@ -1,4 +1,3 @@
-import * as React from "react";
 
 type SwitchProps = {
   checked?: boolean;
