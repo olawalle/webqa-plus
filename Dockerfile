@@ -7,7 +7,9 @@ FROM node:20-slim AS frontend-builder
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm ci
-COPY frontend/ ./
+COPY frontend/index.html frontend/vite.config.ts frontend/tsconfig*.json frontend/postcss.config.js frontend/tailwind.config.ts ./
+COPY frontend/src ./src
+COPY frontend/public ./public
 RUN npm run build
 
 # ── Stage 2: Build Python dependencies ─────────────────────────────────────
